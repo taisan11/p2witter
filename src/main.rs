@@ -3,6 +3,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self};
 use std::time::Duration;
+mod protocol;
 
 fn main() {
     // メインスレッドと通信するためのチャンネル
@@ -62,32 +63,29 @@ fn main() {
             .collect();
         match parts.get(0).map(|s| s.as_str()) {
             Some("/server") => {
-                if let Some(addr) = parts.get(1) {
-                    let addr = addr.clone();
-                    let tx_main = tx_to_main.clone();
-                    let (tx_thread, rx_thread) = mpsc::channel();
-                    active_thread_tx = Some(tx_thread);
-                    let handle = thread::spawn(move || {
-                        start_server(&addr, tx_main, rx_thread);
-                    });
-                    active_thread_handle = Some(handle);
-                } else {
-                    println!("Usage: /server <port>");
-                }
+                if let Some(port) = parts.get(1) {
+                    // ネットワークスレッド未起動なら起動
+                    if active_thread_tx.is_none() {
+                        let tx_main = tx_to_main.clone();
+                        let (tx_thread, rx_thread) = mpsc::channel();
+                        let handle = thread::spawn(move || { run_network(tx_main, rx_thread); });
+                        active_thread_tx = Some(tx_thread);
+                        active_thread_handle = Some(handle);
+                    }
+                    if let Some(ref tx) = active_thread_tx { tx.send(format!("/server {}", port)).ok(); }
+                } else { println!("Usage: /server <port>"); }
             }
             Some("/client") => {
                 if let Some(addr) = parts.get(1) {
-                    let addr = addr.clone();
-                    let tx_main = tx_to_main.clone();
-                    let (tx_thread, rx_thread) = mpsc::channel();
-                    active_thread_tx = Some(tx_thread);
-                    let handle = thread::spawn(move || {
-                        start_client(&addr, tx_main, rx_thread);
-                    });
-                    active_thread_handle = Some(handle);
-                } else {
-                    println!("Usage: /client <addr:port>");
-                }
+                    if active_thread_tx.is_none() {
+                        let tx_main = tx_to_main.clone();
+                        let (tx_thread, rx_thread) = mpsc::channel();
+                        let handle = thread::spawn(move || { run_network(tx_main, rx_thread); });
+                        active_thread_tx = Some(tx_thread);
+                        active_thread_handle = Some(handle);
+                    }
+                    if let Some(ref tx) = active_thread_tx { tx.send(format!("/client {}", addr)).ok(); }
+                } else { println!("Usage: /client <addr:port>"); }
             }
             Some("/exit") => {
                 println!("Exiting...");
@@ -108,93 +106,82 @@ fn main() {
                 break;
             }
             Some(cmd) => {
-                if let Some(ref tx) = active_thread_tx {
-                    if tx.send(cmd.to_string()).is_ok() {
-                        // メッセージをアクティブなスレッドに送信
-                    } else {
-                        println!("No active connection");
-                        active_thread_tx = None;
-                    }
-                } else {
-                    println!("Unknown command: {}", cmd);
-                }
+                // その他はネットワークスレッドへメッセージとして送信（ブロードキャスト）
+                if let Some(ref tx) = active_thread_tx { tx.send(cmd.to_string()).ok(); }
+                else { println!("No network thread. Use /server or /client first"); }
             }
-            None => {
-                // 空行の場合、アクティブなスレッドに送信
-                if let Some(ref tx) = active_thread_tx {
-                    if tx.send(String::new()).is_err() {
-                        active_thread_tx = None;
-                    }
-                }
-            }
+            None => { /* 空行は無視 */ }
         }
     }
 }
 
-fn start_server(port: &str, tx_main: Sender<String>, rx_thread: Receiver<String>) {
-    tx_main.send(format!("server mode start: {}", port)).ok();
-    let listener = match TcpListener::bind(format!("127.0.0.1:{}", port)) {
-        Ok(l) => l,
-        Err(e) => { tx_main.send(format!("Bind error: {:?}", e)).ok(); return; }
-    };
-    listener.set_nonblocking(true).ok();
-    tx_main.send(format!("Listening 127.0.0.1:{} (one client)", port)).ok();
-    // /exit を待ちつつ accept
-    let stream = loop {
-        if let Ok(cmd) = rx_thread.try_recv() {
-            if cmd == "/exit" { tx_main.send("/exit before accept".to_string()).ok(); return; }
-        }
-        match listener.accept() {
-            Ok((s, peer)) => { s.set_nonblocking(true).ok(); tx_main.send(format!("Accepted: {}", peer)).ok(); break s; }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => { thread::sleep(Duration::from_millis(50)); }
-            Err(e) => { tx_main.send(format!("Accept error: {:?}", e)).ok(); return; }
-        }
-    };
-    run_tcp(stream, tx_main, rx_thread);
-    // run_tcp 終了後
-}
-
-fn start_client(addr: &str, tx_main: Sender<String>, rx_thread: Receiver<String>) {
-    tx_main.send(format!("client connect to: {}", addr)).ok();
-    let stream = match TcpStream::connect(addr) {
-        Ok(s) => { s.set_nonblocking(true).ok(); tx_main.send("Connected".to_string()).ok(); s }
-        Err(e) => { tx_main.send(format!("Connect error: {:?}", e)).ok(); return; }
-    };
-    run_tcp(stream, tx_main, rx_thread);
-}
-
-fn run_tcp(mut stream: TcpStream, tx_main: Sender<String>, rx_thread: Receiver<String>) {
-    const ECHO_PREFIX: &str = "[echo] ";
-    tx_main.send("session started".to_string()).ok();
+fn run_network(tx_main: Sender<String>, rx_thread: Receiver<String>) {
+    tx_main.send("network thread started".to_string()).ok();
+    let mut listener: Option<TcpListener> = None;
+    let mut clients: Vec<TcpStream> = Vec::new();
     let mut buf = [0u8; 1024];
+
     loop {
-        // 送信指示
-        match rx_thread.try_recv() {
-            Ok(cmd) => {
-                if cmd == "/exit" { tx_main.send("Exit -> closing".to_string()).ok(); break; }
-                if !cmd.is_empty() {
-                    if let Err(e) = stream.write_all(cmd.as_bytes()) { tx_main.send(format!("Write error: {:?}", e)).ok(); break; }
-                    // tx_main.send(format!("送信: {}", cmd)).ok();
+        // コマンド処理: drain できるだけ読む
+        while let Ok(cmd) = rx_thread.try_recv() {
+            if cmd == "/exit" { tx_main.send("/exit received -> shutting down".to_string()).ok(); return; }
+            if let Some(rest) = cmd.strip_prefix("/server ") {
+                // リスナー開始/再設定
+                match TcpListener::bind(format!("127.0.0.1:{}", rest)) {
+                    Ok(l) => { l.set_nonblocking(true).ok(); listener = Some(l); tx_main.send(format!("Listening on 127.0.0.1:{}", rest)).ok(); }
+                    Err(e) => { tx_main.send(format!("Bind error: {:?}", e)).ok(); }
+                }
+            } else if let Some(rest) = cmd.strip_prefix("/client ") {
+                match TcpStream::connect(rest) {
+                    Ok(s) => { let s=s; s.set_nonblocking(true).ok(); clients.push(s); tx_main.send(format!("Connected to {} (id={})", rest, clients.len()-1)).ok(); }
+                    Err(e) => { tx_main.send(format!("Connect error ({}): {:?}", rest, e)).ok(); }
+                }
+            } else if !cmd.is_empty() {
+                // ブロードキャストメッセージ
+                let mut remove = Vec::new();
+                for (i, c) in clients.iter_mut().enumerate() {
+                    if let Err(e) = c.write_all(cmd.as_bytes()) { tx_main.send(format!("Write error to {}: {:?}", i, e)).ok(); remove.push(i); }
+                }
+                for i in remove.into_iter().rev() { clients.remove(i); }
+            }
+        }
+
+        // accept
+        if let Some(l) = &listener {
+            loop {
+                match l.accept() {
+                    Ok((s, peer)) => { let s=s; s.set_nonblocking(true).ok(); clients.push(s); tx_main.send(format!("Accepted {} (id={})", peer, clients.len()-1)).ok(); }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => { tx_main.send(format!("Accept error: {:?}", e)).ok(); break; }
                 }
             }
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => { tx_main.send("Main disconnected".to_string()).ok(); break; }
         }
-        // 受信
-        match stream.read(&mut buf) {
-            Ok(0) => { tx_main.send("Peer closed".to_string()).ok(); break; }
-            Ok(n) => {
-                let msg = String::from_utf8_lossy(&buf[..n]).to_string();
-                tx_main.send(format!("受信: {}", msg)).ok();
-                if !msg.starts_with(ECHO_PREFIX) { // エコー返し
-                    let echo = format!("{}{}", ECHO_PREFIX, msg);
-                    if let Err(e) = stream.write_all(echo.as_bytes()) { tx_main.send(format!("Echo write error: {:?}", e)).ok(); break; }
-                }
+
+        // 読み取り
+        let mut received: Vec<(usize,String)> = Vec::new();
+        let mut remove_indices: Vec<usize> = Vec::new();
+        for (idx, c) in clients.iter_mut().enumerate() {
+            match c.read(&mut buf) {
+                Ok(0) => { tx_main.send(format!("Client {} closed", idx)).ok(); remove_indices.push(idx); }
+                Ok(n) => { if n>0 { received.push((idx, String::from_utf8_lossy(&buf[..n]).to_string())); } }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => { tx_main.send(format!("Read error {}: {:?}", idx, e)).ok(); remove_indices.push(idx); }
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(e) => { tx_main.send(format!("Read error: {:?}", e)).ok(); break; }
         }
-        thread::sleep(Duration::from_millis(10));
+
+        // 中継
+        for (src, msg) in received.iter() {
+            tx_main.send(format!("受信(id={}): {}", src, msg)).ok();
+            for (idx, c) in clients.iter_mut().enumerate() {
+                if idx == *src { continue; }
+                if let Err(e) = c.write_all(msg.as_bytes()) { tx_main.send(format!("Relay write error to {}: {:?}", idx, e)).ok(); remove_indices.push(idx); }
+            }
+        }
+
+        // 削除
+        remove_indices.sort_unstable(); remove_indices.dedup();
+        for i in remove_indices.into_iter().rev() { clients.remove(i); }
+
+        thread::sleep(Duration::from_millis(15));
     }
-    tx_main.send("session finished".to_string()).ok();
 }
