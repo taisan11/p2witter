@@ -4,14 +4,20 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self};
 use std::time::Duration;
 mod protocol;
+mod config;
 
 fn main() {
     // メインスレッドと通信するためのチャンネル
     let (tx_to_main, rx_from_threads) = mpsc::channel::<String>();
-    
+
     let mut active_thread_tx: Option<Sender<String>> = None;
     let mut active_thread_handle: Option<thread::JoinHandle<()>> = None; // JoinHandle 型は fully qualified で利用
     
+    // config 初期化: なければデフォルト生成
+    if let Err(e) = config::init_config_path("./config.toml") {
+        eprintln!("Failed to init config: {e}");
+    }
+
     loop {
         // 他スレッドからのメッセージを継続的にチェック・表示
         let mut has_new_messages = false;
@@ -21,7 +27,6 @@ fn main() {
         }
         
         if has_new_messages {
-            // メッセージ表示後にプロンプトを再表示
             print!("> ");
             io::stdout().flush().unwrap();
         } else {
@@ -104,6 +109,9 @@ fn main() {
                 
                 println!("All threads finished. Goodbye!");
                 break;
+            }
+            Some("/debug") => {
+                println!("{:?}", config::get_value("hoi"));
             }
             Some(cmd) => {
                 // その他はネットワークスレッドへメッセージとして送信（ブロードキャスト）
