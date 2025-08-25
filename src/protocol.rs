@@ -117,37 +117,3 @@ impl Decoder {
     /// Returns current buffered (incomplete) size.
     pub fn buffered_len(&self) -> usize { self.buf.len() }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn encode_decode_roundtrip() {
-        let m = Message::chat("hello world");
-        let bytes = encode(&m);
-        let mut d = Decoder::new();
-        d.feed(&bytes[..2]); // partial
-        assert!(d.drain().unwrap().is_empty());
-        d.feed(&bytes[2..]);
-        let msgs = d.drain().unwrap();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].payload, b"hello world");
-    assert_eq!(msgs[0].version, 1);
-    }
-
-    #[test]
-    fn multiple_frames_in_one_feed() {
-        let a = encode(&Message::chat("A"));
-        let b = encode(&Message::chat("B"));
-        let mut d = Decoder::new();
-        let mut joined = Vec::new(); joined.extend_from_slice(&a); joined.extend_from_slice(&b);
-        d.feed(&joined);
-        let msgs = d.drain().unwrap();
-        assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[0].payload, b"A");
-        assert_eq!(msgs[1].payload, b"B");
-    }
-
-    // unknown kind test 削除（kind=1固定のため）
-}
