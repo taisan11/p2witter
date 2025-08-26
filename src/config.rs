@@ -51,47 +51,33 @@ pub fn get_value(path: &str) -> Option<Value> {
     cur.cloned()
 }
 
-pub fn set_value(path: &str, value: Value) -> Result<(), String> {
-    let mut tbl = CONFIG
-        .get()
-        .ok_or("config not initialized. call init_config first.")?
-        .write()
-        .map_err(|_| "config lock poisoned")?;
-    let mut cur: &mut Table = &mut *tbl;
-    let mut segments = path.split('.').peekable();
-    while let Some(seg) = segments.next() {
-        if segments.peek().is_none() {
-            // 最後のセグメント
-            if let Some(v) = cur.get_mut(seg) {
-                *v = value;
-                return Ok(());
-            } else {
-                return Err(format!("Key '{}' not found", seg));
-            }
-        } else {
-            // 中間のセグメント
-            if let Some(Value::Table(t)) = cur.get_mut(seg) {
-                cur = t;
-            } else {
-                return Err(format!("Key '{}' not found or not a table", seg));
+/// 任意のパスに値を挿入 (存在しなければ中間テーブルも作成) し、保存する。
+pub fn upsert_value_and_save(path: &str, value: Value) -> Result<(), String> {
+    {
+        let lock = CONFIG.get().ok_or("config not initialized")?;
+        let mut root = lock.write().map_err(|_| "config lock poisoned")?;
+        let mut cur: &mut Table = &mut *root;
+        let mut segments: Vec<&str> = path.split('.').collect();
+        if segments.is_empty() { return Err("empty path".into()); }
+        while segments.len() > 1 {
+            let seg = segments.remove(0);
+            let next = cur.entry(seg.to_string()).or_insert_with(|| Value::Table(Table::new()));
+            match next {
+                Value::Table(t) => { cur = t; }
+                _ => { return Err(format!("segment '{}' is not a table", seg)); }
             }
         }
+        let last = segments.remove(0);
+        cur.insert(last.to_string(), value);
     }
-    Err("Invalid path".into())
+    save().map_err(|e| format!("save failed: {}", e))
 }
 
-pub fn set_value_and_save(path: &str, value: Value) -> Result<(), String> {
-    let result = set_value(path, value);
-    if result.is_ok() {
-        if let Some(lock) = CONFIG.get() {
-            if let Ok(cfg) = lock.read() {
-                if let Err(e) = fs::write("./config.toml", cfg.to_string()) {
-                    return Err(format!("Failed to save config: {}", e));
-                }
-            } else {
-                return Err("Failed to acquire read lock for saving".into());
-            }
-        }
+/// 設定を現在の内容で保存。
+pub fn save() -> Result<(), std::io::Error> {
+    if let Some(lock) = CONFIG.get() {
+        let cfg = lock.read().expect("config lock poisoned");
+        fs::write("./config.toml", cfg.to_string())?;
     }
-    result
+    Ok(())
 }

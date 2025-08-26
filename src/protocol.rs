@@ -1,19 +1,17 @@
-//! Binary protocol definitions (stand‑alone; not yet wired into `main.rs`).
+//! Binary protocol with optional Ed25519 signature + public key.
 //!
-//! Format (little fixed header):
+//! Frame layout (big endian for all u32):
+//!  0: version (u8) =1
+//!  1: kind (u8) =1 (Chat)
+//!  2..6: payload length L (u32)
+//!  6..10: public key length P (u32) (0 or 32 for Ed25519)
+//! 10..14: signature length S (u32) (0 or 64 for Ed25519)
+//! 14..(14+P): public key bytes
+//! (14+P)..(14+P+S): signature bytes
+//! (14+P+S)..(14+P+S+L): payload bytes (UTF-8 chat text)
 //!
-//! Byte 0 : version (u8)
-//! Byte 1 : kind    (u8)  (1=Chat, 2=Cmd (local only usually), 3=System (local), others=Unknown)
-//! Bytes 2..6 : payload length (u32, network / big endian)
-//! Bytes 6..(6+len) : payload raw bytes (UTF-8 for chat text)
-//!
-//! Multiple frames can be concatenated. A frame is complete when the buffer
-//! contains at least 6 bytes header and header-declared payload length bytes.
-//! A decoder accumulates partial bytes and yields `Message` objects.
-//!
-//! This file is not referenced yet from `main.rs`; add `mod protocol;` later
-//! to integrate. All logic is self-contained so you can unit test after adding
-//! the `mod` line (or moving into a library crate).
+//! Signature (when present) is over: version || kind || payload_len(be) || payload bytes.
+//! 公開鍵や署名サイズは署名対象外 (シンプル化)。
 
 use std::fmt;
 
@@ -31,13 +29,15 @@ impl MsgKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
     pub version: u8,
-    // 将来の拡張余地: 今は kind 固定 (=1)
     pub payload: Vec<u8>,
+    pub public_key: Option<Vec<u8>>, // 32 bytes when present
+    pub signature: Option<Vec<u8>>,  // 64 bytes when present
 }
 
 #[allow(dead_code)]
 impl Message {
-    pub fn chat(text: &str) -> Self { Self { version: 1, payload: text.as_bytes().to_vec() } }
+    pub fn chat(text: &str) -> Self { Self { version: 1, payload: text.as_bytes().to_vec(), public_key: None, signature: None } }
+    pub fn with_key_sig(mut self, pk: Vec<u8>, sig: Vec<u8>) -> Self { self.public_key = Some(pk); self.signature = Some(sig); self }
 }
 
 /// Errors that can occur during decoding.
@@ -48,6 +48,8 @@ pub enum ProtocolError {
     LengthTooLarge(u32),
     /// Version not supported.
     UnsupportedVersion(u8),
+    /// Signature verification failed
+    BadSignature,
 }
 
 impl fmt::Display for ProtocolError {
@@ -55,6 +57,7 @@ impl fmt::Display for ProtocolError {
         match self {
             ProtocolError::LengthTooLarge(l) => write!(f, "length too large: {}", l),
             ProtocolError::UnsupportedVersion(v) => write!(f, "unsupported version: {}", v),
+            ProtocolError::BadSignature => write!(f, "bad signature"),
         }
     }
 }
@@ -64,11 +67,17 @@ impl std::error::Error for ProtocolError {}
 /// Encode a message into owned bytes (single frame).
 #[allow(dead_code)]
 pub fn encode(msg: &Message) -> Vec<u8> {
-    let mut out = Vec::with_capacity(6 + msg.payload.len());
-    out.push(msg.version); // version
-    out.push(MsgKind::CHAT); // kind (1)
-    let len = msg.payload.len() as u32;
-    out.extend_from_slice(&len.to_be_bytes()); // length (big endian)
+    let payload_len = msg.payload.len() as u32;
+    let (pk_len, pk_bytes) = match &msg.public_key { Some(pk) => (pk.len() as u32, pk.as_slice()), None => (0u32, &[][..]) };
+    let (sig_len, sig_bytes) = match &msg.signature { Some(sig) => (sig.len() as u32, sig.as_slice()), None => (0u32, &[][..]) };
+    let mut out = Vec::with_capacity(14 + pk_bytes.len() + sig_bytes.len() + msg.payload.len());
+    out.push(msg.version);
+    out.push(MsgKind::CHAT);
+    out.extend_from_slice(&payload_len.to_be_bytes());
+    out.extend_from_slice(&pk_len.to_be_bytes());
+    out.extend_from_slice(&sig_len.to_be_bytes());
+    out.extend_from_slice(pk_bytes);
+    out.extend_from_slice(sig_bytes);
     out.extend_from_slice(&msg.payload);
     out
 }
@@ -97,23 +106,39 @@ impl Decoder {
     pub fn drain(&mut self) -> Result<Vec<Message>, ProtocolError> {
         let mut out = Vec::new();
         loop {
-            if self.buf.len() < 6 { break; } // not enough header
+            if self.buf.len() < 14 { break; }
             let version = self.buf[0];
             if version != 1 { return Err(ProtocolError::UnsupportedVersion(version)); }
             let kind_byte = self.buf[1];
             if kind_byte != MsgKind::CHAT { return Err(ProtocolError::UnsupportedVersion(kind_byte)); }
-            let len = u32::from_be_bytes([self.buf[2], self.buf[3], self.buf[4], self.buf[5]]);
-            if len > self.max_payload { return Err(ProtocolError::LengthTooLarge(len)); }
-            let needed = 6 + (len as usize);
-            if self.buf.len() < needed { break; } // wait for more
-            let payload = self.buf[6..needed].to_vec();
-            // remove frame
+            let payload_len = u32::from_be_bytes([self.buf[2], self.buf[3], self.buf[4], self.buf[5]]);
+            if payload_len > self.max_payload { return Err(ProtocolError::LengthTooLarge(payload_len)); }
+            let pk_len = u32::from_be_bytes([self.buf[6], self.buf[7], self.buf[8], self.buf[9]]);
+            let sig_len = u32::from_be_bytes([self.buf[10], self.buf[11], self.buf[12], self.buf[13]]);
+            let needed = 14 + pk_len as usize + sig_len as usize + payload_len as usize;
+            if self.buf.len() < needed { break; }
+            let mut cursor = 14;
+            let pk = if pk_len > 0 { Some(self.buf[cursor..cursor+pk_len as usize].to_vec()) } else { None };
+            cursor += pk_len as usize;
+            let sig = if sig_len > 0 { Some(self.buf[cursor..cursor+sig_len as usize].to_vec()) } else { None };
+            cursor += sig_len as usize;
+            let payload = self.buf[cursor..cursor+payload_len as usize].to_vec();
             self.buf.drain(..needed);
-            out.push(Message { version, payload });
+            out.push(Message { version, payload, public_key: pk, signature: sig });
         }
         Ok(out)
     }
 
     /// Returns current buffered (incomplete) size.
     pub fn buffered_len(&self) -> usize { self.buf.len() }
+}
+
+/// 署名対象バイト列 (version, kind, payload_len, payload)
+pub fn signing_bytes(msg: &Message) -> Vec<u8> {
+    let mut v = Vec::with_capacity(6 + msg.payload.len());
+    v.push(msg.version);
+    v.push(MsgKind::CHAT);
+    v.extend_from_slice(&(msg.payload.len() as u32).to_be_bytes());
+    v.extend_from_slice(&msg.payload);
+    v
 }
