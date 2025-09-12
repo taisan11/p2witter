@@ -51,7 +51,7 @@ pub fn get_value(path: &str) -> Option<Value> {
     cur.cloned()
 }
 
-/// 任意のパスに値を挿入 (存在しなければ中間テーブルも作成) し、保存する。
+/// 任意のパスに値を挿入 (存在しなければ中間テーブルも作成) し、保存してからディスクから再読み込みする。
 pub fn upsert_value_and_save(path: &str, value: Value) -> Result<(), String> {
     {
         let lock = CONFIG.get().ok_or("config not initialized")?;
@@ -70,7 +70,21 @@ pub fn upsert_value_and_save(path: &str, value: Value) -> Result<(), String> {
         let last = segments.remove(0);
         cur.insert(last.to_string(), value);
     }
-    save().map_err(|e| format!("save failed: {}", e))
+
+    // 保存
+    save().map_err(|e| format!("save failed: {}", e))?;
+
+    // 保存先ファイルから再読み込みしてメモリ上の CONFIG を更新する
+    let content = fs::read_to_string("./config.toml").map_err(|e| format!("reload read failed: {}", e))?;
+    let table: Table = content.parse().map_err(|e| format!("reload parse failed: {}", e))?;
+
+    if let Some(lock) = CONFIG.get() {
+        let mut root = lock.write().map_err(|_| "config lock poisoned".to_string())?;
+        *root = table;
+        Ok(())
+    } else {
+        Err("config not initialized".into())
+    }
 }
 
 /// 設定を現在の内容で保存。

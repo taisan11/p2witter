@@ -7,6 +7,22 @@ mod protocol;
 mod config;
 mod crypto;
 
+fn current_unix_millis() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+}
+
+// 署名付きチャット送信 (全体ブロードキャスト) - 鍵必須
+fn build_signed_chat(text: &str, pkcs8: &[u8], pubk: &[u8]) -> Option<protocol::Message> {
+    let mut m = protocol::Message::chat(text, current_unix_millis());
+    if let Ok(sig) = crypto::sign_ed25519(&protocol::signing_bytes(&m), pkcs8) { m = m.with_key_sig(pubk.to_vec(), sig); Some(m) } else { None }
+}
+// 署名付きDM
+fn build_signed_dm(text: &str, pkcs8: &[u8], pubk: &[u8]) -> Option<protocol::Message> {
+    let mut m = protocol::Message::dm(text, current_unix_millis());
+    if let Ok(sig) = crypto::sign_ed25519(&protocol::signing_bytes(&m), pkcs8) { m = m.with_key_sig(pubk.to_vec(), sig); Some(m) } else { None }
+}
+
 fn main() {
     // メインスレッドと通信するためのチャンネル
     let (tx_to_main, rx_from_threads) = mpsc::channel::<String>();
@@ -68,9 +84,8 @@ fn main() {
             .map(|s| s.to_string())
             .collect();
         match parts.get(0).map(|s| s.as_str()) {
-            Some("/server") => {
+            Some("/open") => {
                 if let Some(port) = parts.get(1) {
-                    // ネットワークスレッド未起動なら起動
                     if active_thread_tx.is_none() {
                         let tx_main = tx_to_main.clone();
                         let (tx_thread, rx_thread) = mpsc::channel();
@@ -78,10 +93,10 @@ fn main() {
                         active_thread_tx = Some(tx_thread);
                         active_thread_handle = Some(handle);
                     }
-                    if let Some(ref tx) = active_thread_tx { tx.send(format!("/server {}", port)).ok(); }
-                } else { println!("Usage: /server <port>"); }
+                    if let Some(ref tx) = active_thread_tx { tx.send(format!("/open {}", port)).ok(); }
+                } else { println!("Usage: /open <port>"); }
             }
-            Some("/client") => {
+            Some("/connect") => {
                 if let Some(addr) = parts.get(1) {
                     if active_thread_tx.is_none() {
                         let tx_main = tx_to_main.clone();
@@ -90,8 +105,8 @@ fn main() {
                         active_thread_tx = Some(tx_thread);
                         active_thread_handle = Some(handle);
                     }
-                    if let Some(ref tx) = active_thread_tx { tx.send(format!("/client {}", addr)).ok(); }
-                } else { println!("Usage: /client <addr:port>"); }
+                    if let Some(ref tx) = active_thread_tx { tx.send(format!("/connect {}", addr)).ok(); }
+                } else { println!("Usage: /connect <addr:port>"); }
             }
             Some("/exit") => {
                 println!("Exiting...");
@@ -111,9 +126,7 @@ fn main() {
                 println!("All threads finished. Goodbye!");
                 break;
             }
-            Some("/debug") => {
-                println!("{:?}", config::get_value("hoi"));
-            }
+            Some("/debug") => { println!("{:?}", config::get_value("hoi")); }
             Some("/init") => {
                 // 鍵生成して config に保存 (上書き)
                 match crypto::generate_ed25519_keypair() {
@@ -125,12 +138,32 @@ fn main() {
                     Err(e) => eprintln!("鍵生成失敗: {e}"),
                 }
             }
-            Some(cmd) => {
-                // その他はネットワークスレッドへメッセージとして送信（署名付きチャット）
-                if let Some(ref tx) = active_thread_tx { tx.send(format!("/msg {}", cmd)).ok(); }
+            Some("/peers") => {
+                if let Some(ref tx) = active_thread_tx { tx.send("/peers".to_string()).ok(); }
                 else { println!("No network thread. Use /server or /client first"); }
             }
-            None => { /* 空行は無視 */ }
+            Some("/close") => {
+                if let Some(ref tx) = active_thread_tx { tx.send("/close".to_string()).ok(); }
+                else { println!("No network thread. Use /open first"); }
+            }
+            Some("/disconnect") => {
+                if parts.len() < 2 { println!("Usage: /disconnect <id>"); continue; }
+                if let Some(ref tx) = active_thread_tx { tx.send(format!("/disconnect {}", parts[1])).ok(); }
+                else { println!("No network thread. Use /connect or /open first"); }
+            }
+            Some("/dm") => {
+                if parts.len() < 3 { println!("Usage: /dm <to_id> <message>"); continue; }
+                let to_id = &parts[1];
+                let value = parts[2..].join(" ");
+                if let Some(ref tx) = active_thread_tx { tx.send(format!("/dm {} {}", to_id, value)).ok(); } else { println!("No network thread. Use /server or /client first"); }
+            }
+            Some(other) => {
+                // コマンドとして既知でない → 通常メッセージ扱い
+                if other.starts_with('/') { println!("Unknown command: {}", other); }
+                else if let Some(ref tx) = active_thread_tx { tx.send(format!("/msg {}", input)).ok(); }
+                else { println!("No network thread. Use /server or /client first"); }
+            }
+            None => { /* ignore */ }
         }
     }
 }
@@ -144,57 +177,86 @@ fn run_network(tx_main: Sender<String>, rx_thread: Receiver<String>) {
     let mut buf = [0u8; 2048];
 
     // 署名用鍵を読む (存在しなければ None)
-    let (pkcs8, public) = {
-        let pkcs8_hex = config::get_value("key.pkcs8").and_then(|v| v.as_str().map(|s| s.to_string()));
-        let pub_hex = config::get_value("key.public").and_then(|v| v.as_str().map(|s| s.to_string()));
-        match (pkcs8_hex, pub_hex) {
-            (Some(a), Some(b)) => {
-                let pkcs8 = crypto::from_hex(&a).unwrap_or_default();
-                let public = crypto::from_hex(&b).unwrap_or_default();
-                if pkcs8.is_empty() || public.is_empty() { (None, None) } else { (Some(pkcs8), Some(public)) }
-            }
-            _ => (None, None)
-        }
-    };
+    let mut pkcs8: Option<Vec<u8>> = None;
+    let mut public: Option<Vec<u8>> = None;
+    // 起動時に読み込み ( /init 後は再起動で有効 )。将来ホットリロードするなら /reload 等追加。
+    if let (Some(pk_hex), Some(pub_hex)) = (
+        config::get_value("key.pkcs8").and_then(|v| v.as_str().map(|s| s.to_string())),
+        config::get_value("key.public").and_then(|v| v.as_str().map(|s| s.to_string()))
+    ) {
+        let pk_bytes = crypto::from_hex(&pk_hex).unwrap_or_default();
+        let pub_bytes = crypto::from_hex(&pub_hex).unwrap_or_default();
+        if !pk_bytes.is_empty() && !pub_bytes.is_empty() { pkcs8 = Some(pk_bytes); public = Some(pub_bytes); }
+    }
 
     loop {
         // コマンド処理: drain できるだけ読む
         while let Ok(cmd) = rx_thread.try_recv() {
             if cmd == "/exit" { tx_main.send("/exit received -> shutting down".to_string()).ok(); return; }
-            if let Some(rest) = cmd.strip_prefix("/server ") {
-                // リスナー開始/再設定
-                match TcpListener::bind(format!("127.0.0.1:{}", rest)) {
-                    Ok(l) => { l.set_nonblocking(true).ok(); listener = Some(l); tx_main.send(format!("Listening on 127.0.0.1:{}", rest)).ok(); }
-                    Err(e) => { tx_main.send(format!("Bind error: {:?}", e)).ok(); }
+            if let Some(rest) = cmd.strip_prefix("/open ") {
+                if listener.is_some() {
+                    tx_main.send("already listening (only one /open allowed)".into()).ok();
+                } else {
+                    match TcpListener::bind(format!("127.0.0.1:{}", rest)) {
+                        Ok(l) => { l.set_nonblocking(true).ok(); listener = Some(l); tx_main.send(format!("Listening on 127.0.0.1:{}", rest)).ok(); }
+                        Err(e) => { tx_main.send(format!("Bind error: {:?}", e)).ok(); }
+                    }
                 }
-            } else if let Some(rest) = cmd.strip_prefix("/client ") {
+            } else if let Some(rest) = cmd.strip_prefix("/connect ") {
                 match TcpStream::connect(rest) {
                     Ok(s) => { let s=s; s.set_nonblocking(true).ok(); clients.push(s); decoders.push(protocol::Decoder::new()); tx_main.send(format!("Connected to {} (id={})", rest, clients.len()-1)).ok(); }
                     Err(e) => { tx_main.send(format!("Connect error ({}): {:?}", rest, e)).ok(); }
                 }
+            } else if cmd == "/close" {
+                if listener.is_some() { listener = None; tx_main.send("listener closed".into()).ok(); } else { tx_main.send("no active listener".into()).ok(); }
+            } else if let Some(rest) = cmd.strip_prefix("/disconnect ") {
+                if let Ok(id) = rest.trim().parse::<usize>() {
+                    if id < clients.len() { clients.remove(id); decoders.remove(id); tx_main.send(format!("disconnected id {}", id)).ok(); }
+                    else { tx_main.send(format!("disconnect: invalid id {}", id)).ok(); }
+                } else { tx_main.send(format!("disconnect: parse error '{}': expected number", rest)).ok(); }
+            } else if cmd == "/peers" {
+                let mut lines = Vec::new();
+                lines.push(format!("peers total={} listening={}", clients.len(), listener.is_some()));
+                for (i, c) in clients.iter().enumerate() {
+                    let addr = c.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into());
+                    lines.push(format!("id={} addr={}", i, addr));
+                }
+                tx_main.send(lines.join("\n")).ok();
             } else if let Some(rest) = cmd.strip_prefix("/msg ") {
                 // 送信メッセージをプロトコルフレーム化
-                let mut m = protocol::Message::chat(rest);
-                if let (Some(pkcs8), Some(pubk)) = (pkcs8.as_ref(), public.as_ref()) {
-                    // 署名
-                    if let Ok(sig) = crypto::sign_ed25519(&protocol::signing_bytes(&m), pkcs8) {
-                        m = m.with_key_sig(pubk.clone(), sig);
+                if let (Some(ref pk), Some(ref pubk)) = (pkcs8.as_ref(), public.as_ref()) {
+                    if let Some(m) = build_signed_chat(rest, pk, pubk) {
+                        let frame = protocol::encode(&m);
+                        let mut remove = Vec::new();
+                        for (i, c) in clients.iter_mut().enumerate() {
+                            if let Err(e) = c.write_all(&frame) { tx_main.send(format!("Write error to {}: {:?}", i, e)).ok(); remove.push(i); }
+                        }
+                        for i in remove.into_iter().rev() { clients.remove(i); decoders.remove(i); }
+                    } else { tx_main.send("署名生成失敗".into()).ok(); }
+                } else {
+                    tx_main.send("鍵未生成 (/init を先に実行)".into()).ok();
+                }
+            } else if let Some(rest) = cmd.strip_prefix("/dm ") {
+                // /dm <to_id> <message>
+                let mut iter = rest.splitn(2, ' ');
+                let to = iter.next().unwrap_or("");
+                let msg_body = iter.next().unwrap_or("");
+                if let Ok(target) = to.parse::<usize>() {
+                    if target < clients.len() {
+                        if let (Some(ref pk), Some(ref pubk)) = (pkcs8.as_ref(), public.as_ref()) {
+                            if let Some(m) = build_signed_dm(msg_body, pk, pubk) {
+                                let frame = protocol::encode(&m);
+                                if let Err(e) = clients[target].write_all(&frame) { tx_main.send(format!("DM write error to {}: {:?}", target, e)).ok(); }
+                            } else { tx_main.send("DM署名生成失敗".into()).ok(); }
+                        } else { tx_main.send("鍵未生成 (/init を先に実行)".into()).ok(); }
+                    } else {
+                        tx_main.send(format!("DM target id {} out of range", target)).ok();
                     }
+                } else {
+                    tx_main.send(format!("Invalid dm target: {}", to)).ok();
                 }
-                let frame = protocol::encode(&m);
-                let mut remove = Vec::new();
-                for (i, c) in clients.iter_mut().enumerate() {
-                    if let Err(e) = c.write_all(&frame) { tx_main.send(format!("Write error to {}: {:?}", i, e)).ok(); remove.push(i); }
-                }
-                for i in remove.into_iter().rev() { clients.remove(i); decoders.remove(i); }
             } else if !cmd.is_empty() {
-                // ブロードキャストメッセージ
-                // (旧テキストモード) 一応互換: プレーン送信
-                let mut remove = Vec::new();
-                for (i, c) in clients.iter_mut().enumerate() {
-                    if let Err(e) = c.write_all(cmd.as_bytes()) { tx_main.send(format!("Write error to {}: {:?}", i, e)).ok(); remove.push(i); }
-                }
-                for i in remove.into_iter().rev() { clients.remove(i); decoders.remove(i); }
+                // 旧テキスト互換は廃止: 非コマンド入力は /msg 側で処理される
             }
         }
 
@@ -221,16 +283,25 @@ fn run_network(tx_main: Sender<String>, rx_thread: Receiver<String>) {
             }
         }
 
-        // 中継 (フレームをそのまま再送: 署名保持)
+        // 中継と表示 + 署名検証
         for (src, msg) in received_frames.iter() {
-            // 表示用テキスト: 署名状態
             let txt = String::from_utf8_lossy(&msg.payload);
-            let signed = if msg.signature.is_some() { "signed" } else { "plain" };
-            tx_main.send(format!("受信(id={}): {} [{}]", src, txt, signed)).ok();
-            let frame = protocol::encode(msg);
-            for (idx, c) in clients.iter_mut().enumerate() {
-                if idx == *src { continue; }
-                if let Err(e) = c.write_all(&frame) { tx_main.send(format!("Relay write error to {}: {:?}", idx, e)).ok(); remove_indices.push(idx); }
+            let mut signed_state = if msg.signature.is_some() { "signed" } else { "plain" };
+            if let (Some(sig), Some(pk)) = (msg.signature.as_ref(), msg.public_key.as_ref()) {
+                // 検証
+                let minimal = protocol::Message { version: msg.version, kind: msg.kind, payload: msg.payload.clone(), timestamp: msg.timestamp, public_key: None, signature: None };
+                let data = protocol::signing_bytes(&minimal);
+                if crypto::verify_ed25519(&data, sig, pk).is_err() { signed_state = "bad-signature"; }
+            }
+            if msg.kind == protocol::MsgKind::DM {
+                tx_main.send(format!("DM!! from:{} {} [{}]", src, txt, signed_state)).ok();
+            } else {
+                tx_main.send(format!("受信(id={}): {} [{}]", src, txt, signed_state)).ok();
+                let frame = protocol::encode(msg);
+                for (idx, c) in clients.iter_mut().enumerate() {
+                    if idx == *src { continue; }
+                    if let Err(e) = c.write_all(&frame) { tx_main.send(format!("Relay write error to {}: {:?}", idx, e)).ok(); remove_indices.push(idx); }
+                }
             }
         }
 
