@@ -84,13 +84,14 @@ fn main() {
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture).ok();
     // 差分描画用状態と関数 + スクロール/履歴状態 + ステータスバー
-    struct DrawState { last_msg_len: usize, last_input_len: usize, force_full: bool }
-    impl DrawState { fn new() -> Self { Self { last_msg_len: 0, last_input_len: 0, force_full: true } } }
+    struct DrawState { last_msg_len: usize, last_input_len: usize, last_cursor_pos: usize, force_full: bool }
+    impl DrawState { fn new() -> Self { Self { last_msg_len: 0, last_input_len: 0, last_cursor_pos: 0, force_full: true } } }
     fn redraw_full(stdout: &mut io::Stdout, messages: &Vec<String>, scroll_offset: usize, status_msg: &str) -> (u16,u16) {
         use crossterm::{terminal, queue, cursor};
         use crossterm::terminal::{Clear, ClearType};
     use crossterm::style::{self};
         let (w, h) = terminal::size().unwrap_or((80,24));
+        let safe_w = w.saturating_sub(1) as usize; // 末尾1桁は未使用にして自動折返しを回避
         let input_row = h.saturating_sub(1); // 最下行
         let msg_area_rows = if h >= 2 { (h - 2) as usize } else { 0 }; // 上1行ステータス, 下1行入力
         // スクロールオフセット: 0 が最新。offset が増えると過去方向
@@ -104,20 +105,20 @@ fn main() {
         // ステータスバークリア
         queue!(stdout, cursor::MoveTo(0,0), Clear(ClearType::CurrentLine)).ok();
         // ステータス文字列組み立て
-    let bar_core = format!(" p2witter | スクロール:{}/{} ", off, max_scroll);
+        let bar_core = format!(" p2witter | スクロール:{}/{} ", off, max_scroll);
         let mut bar = bar_core.clone();
     if !status_msg.is_empty() { bar.push_str(status_msg); }
-    if display_width(&bar) > w as usize { bar = truncate_display(&bar, w as usize); }
+    if display_width(&bar) > safe_w { bar = truncate_display(&bar, safe_w); }
         queue!(stdout, cursor::MoveTo(0,0)).ok();
         // 反転表示 (端末対応簡易)
         queue!(stdout, style::SetAttribute(style::Attribute::Reverse)).ok();
-        let _ = write!(stdout, "{:<width$}", bar, width = w as usize);
+        let _ = write!(stdout, "{}", bar);
         queue!(stdout, style::SetAttribute(style::Attribute::Reset)).ok();
         // メッセージ領域クリア & 描画 (y=1 .. input_row-1)
         for y in 1..input_row { queue!(stdout, cursor::MoveTo(0,y), Clear(ClearType::CurrentLine)).ok(); }
         for (i, msg) in messages.iter().enumerate().skip(start) {
             let y = (i-start) as u16 + 1; if y >= input_row { break; }
-            let mut line = msg.replace('\n', "\\n"); if display_width(&line) > w as usize { line = truncate_display(&line, w as usize); }
+            let mut line = msg.replace('\n', "\\n"); if display_width(&line) > safe_w { line = truncate_display(&line, safe_w); }
             queue!(stdout, cursor::MoveTo(0,y)).ok(); let _ = write!(stdout, "{}", line);
         }
         (w,h)
@@ -126,9 +127,10 @@ fn main() {
         use crossterm::{terminal, queue, cursor};
         use crossterm::terminal::{Clear, ClearType};
     let (w, h) = terminal::size().unwrap_or((80,24)); let y = h.saturating_sub(1);
+    let safe_w = w.saturating_sub(1) as usize; // 自動折返し回避
     queue!(stdout, cursor::MoveTo(0,y), Clear(ClearType::CurrentLine)).ok();
     // 入力の表示幅でスクロールしつつ表示（カーソル位置を中心に可視化）
-    let max_input_cols = w.saturating_sub(2) as usize; // "> " のぶん
+    let max_input_cols = safe_w.saturating_sub(2); // "> " のぶん、末尾1桁は空ける
     let (left, right) = split_at_char(input, cursor_pos);
     let left_w = display_width(&left);
     let shown_input = if left_w <= max_input_cols {
@@ -139,16 +141,16 @@ fn main() {
         take_last_display(&left, max_input_cols)
     };
     let prompt = format!("> {}", shown_input);
-    let _ = write!(stdout, "{:<width$}", prompt, width = w as usize);
+    let _ = write!(stdout, "{}", prompt);
     let caret_cols_in_prompt = if left_w <= max_input_cols { left_w } else { display_width(&shown_input) };
     let caret_cols_total = 2usize + caret_cols_in_prompt;
-    let caret_x = if w == 0 { 0 } else { caret_cols_total.min((w - 1) as usize) } as u16;
+    let caret_x = if w == 0 { 0 } else { caret_cols_total.min(safe_w) } as u16;
     queue!(stdout, cursor::MoveTo(caret_x, y), cursor::Show).ok();
     }
     fn render(stdout: &mut io::Stdout, messages: &Vec<String>, input: &str, st: &mut DrawState, scroll_offset: usize, status_msg: &str, cursor_pos: usize) {
         let need_full = st.force_full || st.last_msg_len != messages.len();
         if need_full { redraw_full(stdout, messages, scroll_offset, status_msg); st.last_msg_len = messages.len(); st.force_full = false; }
-        if need_full || st.last_input_len != input.len() { redraw_input(stdout, input, cursor_pos); st.last_input_len = input.len(); }
+        if need_full || st.last_input_len != input.len() || st.last_cursor_pos != cursor_pos { redraw_input(stdout, input, cursor_pos); st.last_input_len = input.len(); st.last_cursor_pos = cursor_pos; }
         let _ = stdout.flush();
     }
     let mut draw_state = DrawState::new();
@@ -216,7 +218,6 @@ fn main() {
                                 left.push(ch);
                                 input = left + &right;
                                 cursor_pos += 1;
-                                redraw_input(&mut stdout, &input, cursor_pos);
                             }
                             KeyCode::Backspace => {
                                 if cursor_pos > 0 {
@@ -225,17 +226,14 @@ fn main() {
                                     left2.pop(); // 1 文字削除（pop は UTF-8 末尾 1 文字）
                                     input = left2 + &right;
                                     cursor_pos -= 1;
-                                    redraw_input(&mut stdout, &input, cursor_pos);
                                 }
                             }
                             KeyCode::Left => {
                                 if cursor_pos > 0 { cursor_pos -= 1; }
-                                redraw_input(&mut stdout, &input, cursor_pos);
                             }
                             KeyCode::Right => {
                                 let total = input.chars().count();
                                 if cursor_pos < total { cursor_pos += 1; }
-                                redraw_input(&mut stdout, &input, cursor_pos);
                             }
                             KeyCode::Enter => {
                                 let line = input.trim().to_string();
@@ -301,23 +299,26 @@ fn main() {
                                     }
                                     Some("/certs") => { if let Some(ref tx) = active_thread_tx { tx.send("/certs".into()).ok(); } else { status_msg = "ネットワークスレッドがありません。".into(); draw_state.force_full = true; } }
                                     Some("/cert") => { if parts.len()<2 { status_msg = "使い方: /cert <id>".into(); draw_state.force_full = true; } else if let Some(ref tx)=active_thread_tx { tx.send(format!("/cert {}", parts[1])).ok(); } else { status_msg = "ネットワークスレッドがありません。".into(); draw_state.force_full = true; } }
+                                    Some("/msg") => {
+                                        if parts.len() < 2 { status_msg = "使い方: /msg <message>".into(); draw_state.force_full = true; }
+                                        else if let Some(ref tx) = active_thread_tx { let value=parts[1..].join(" "); tx.send(format!("/msg {}", value)).ok(); } else { status_msg = "ネットワークスレッドがありません。".into(); draw_state.force_full = true; }
+                                    }
                                     Some(other) => {
                                         if other.starts_with('/') { status_msg = format!("不明なコマンド: {}", other); draw_state.force_full = true; }
                                         else if let Some(ref tx) = active_thread_tx { tx.send(format!("/msg {}", line)).ok(); } else { status_msg = "ネットワークスレッドがありません。".into(); draw_state.force_full = true; }
                                     }
                                     None => {}
                                 }
-                                input.clear(); cursor_pos = 0; redraw_input(&mut stdout, &input, cursor_pos);
+                                input.clear(); cursor_pos = 0;
                                 if !line.is_empty() { history.push(line); history_pos = None; }
                             }
-                            KeyCode::Esc => { input.clear(); cursor_pos = 0; redraw_input(&mut stdout, &input, cursor_pos); history_pos = None; }
+                            KeyCode::Esc => { input.clear(); cursor_pos = 0; history_pos = None; }
                             KeyCode::Up => {
                                 if history.is_empty() { continue; }
                                 let new_pos = match history_pos { None => history.len().saturating_sub(1), Some(p) => p.saturating_sub(1) };
                                 history_pos = Some(new_pos);
                                 input = history[new_pos].clone();
                                 cursor_pos = input.chars().count();
-                                redraw_input(&mut stdout, &input, cursor_pos);
                             }
                             KeyCode::Down => {
                                 if history.is_empty() { continue; }
@@ -325,7 +326,6 @@ fn main() {
                                     if p + 1 < history.len() { history_pos = Some(p+1); input = history[p+1].clone(); }
                                     else { history_pos = None; input.clear(); }
                                     cursor_pos = input.chars().count();
-                                    redraw_input(&mut stdout, &input, cursor_pos);
                                 }
                             }
                             KeyCode::Tab => {}
@@ -494,8 +494,6 @@ fn run_network(tx_main: Sender<String>, rx_thread: Receiver<String>) {
                 } else {
                     tx_main.send(format!("不正な DM 宛先: {}", to)).ok();
                 }
-            } else if !cmd.is_empty() {
-                // 旧テキスト互換は廃止: 非コマンド入力は /msg 側で処理される
             }
         }
 
