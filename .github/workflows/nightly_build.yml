@@ -28,7 +28,7 @@ jobs:
       run: cargo build --verbose  # デバッグビルド（リリース版は--releaseを追加）
 
     - name: Upload build artifacts
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: p2witter-build
         path: target/debug/p2witter
