@@ -1,0 +1,34 @@
+name: Rust Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0  # インクリメンタルコンパイルを無効化（キャッシュ効率向上のため）
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v5
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable  # stable版Rustをインストール（必要に応じてnightlyなどに変更）
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2  # Cargoとtargetディレクトリをキャッシュ
+
+    - name: Build
+      run: cargo build --verbose  # デバッグビルド（リリース版は--releaseを追加）
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: p2witter-build
+        path: target/debug/p2witter
