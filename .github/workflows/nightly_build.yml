@@ -1,4 +1,4 @@
-name: Rust Build
+name: Nightly Build
 
 on:
   push:
@@ -8,27 +8,38 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: 0  # インクリメンタルコンパイルを無効化（キャッシュ効率向上のため）
+  CARGO_INCREMENTAL: 0
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: p2witter-linux-x86_64
+            bin_path: target/release/p2witter
+          - os: windows-latest
+            artifact_name: p2witter-windows-x86_64
+            bin_path: target/release/p2witter.exe
+    runs-on: ${{ matrix.os }}
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v5
+      - name: Checkout code
+        uses: actions/checkout@v5
 
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable  # stable版Rustをインストール（必要に応じてnightlyなどに変更）
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
 
-    - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@v2  # Cargoとtargetディレクトリをキャッシュ
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
 
-    - name: Build
-      run: cargo build --verbose  # デバッグビルド（リリース版は--releaseを追加）
+      - name: Build (release)
+        run: cargo build --verbose
 
-    - name: Upload build artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: p2witter-build
-        path: target/debug/p2witter
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.bin_path }}
+          if-no-files-found: error
