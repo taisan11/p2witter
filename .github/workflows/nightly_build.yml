@@ -18,10 +18,10 @@ jobs:
         include:
           - os: ubuntu-latest
             artifact_name: p2witter-linux-x86_64
-            bin_path: target/release/p2witter
+            bin_path: target/debug/p2witter
           - os: windows-latest
             artifact_name: p2witter-windows-x86_64
-            bin_path: target/release/p2witter.exe
+            bin_path: target/debug/p2witter.exe
     runs-on: ${{ matrix.os }}
 
     steps:
