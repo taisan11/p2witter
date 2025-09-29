@@ -11,6 +11,7 @@
 use ring::{
     rand::{SecureRandom, SystemRandom},
     signature::{self, Ed25519KeyPair, KeyPair},
+    aead::{self, LessSafeKey, UnboundKey, Nonce, Aad},
 };
 
 #[derive(Debug)]
@@ -19,6 +20,8 @@ pub enum CryptoError {
     Key,
     Sign,
     Verify,
+    Encrypt,
+    Decrypt,
 }
 
 impl std::fmt::Display for CryptoError {
@@ -32,6 +35,8 @@ impl std::fmt::Display for CryptoError {
                 Key => "鍵操作に失敗",
                 Sign => "署名に失敗",
                 Verify => "検証に失敗",
+                Encrypt => "暗号化に失敗",
+                Decrypt => "復号に失敗",
             }
         )
     }
@@ -110,4 +115,47 @@ fn hex_val(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
+}
+
+// ---- 簡易接続情報暗号化（アプリ内埋め込み鍵を使用） ----
+
+// 32バイト固定鍵（デモ用途・簡易用途）。実運用ではビルド時に差し替えるなど要配慮。
+// ここでは定数値を例として埋め込み。変更すると古いトークンは復号できなくなります。
+const CONNINFO_KEY: [u8; 32] = [
+    0x42,0x95,0xAE,0x10,0x2C,0x7D,0x3F,0x81,
+    0x19,0xA2,0x5B,0xCC,0xD3,0x0E,0x77,0x6A,
+    0x91,0x54,0x23,0x88,0x0F,0xDE,0x63,0x11,
+    0x90,0xAB,0xC4,0x55,0x66,0xE1,0x2D,0x3C,
+];
+
+/// addr:port などの接続文字列を暗号化し、hex文字列トークンとして返す。
+/// 形式: hex(nonce(12B) || ciphertext+tag)
+pub fn encrypt_conninfo_to_hex(conn: &str) -> Result<String, CryptoError> {
+    let key = LessSafeKey::new(UnboundKey::new(&aead::CHACHA20_POLY1305, &CONNINFO_KEY).map_err(|_| CryptoError::Key)?);
+    let rng = SystemRandom::new();
+    let mut nonce_bytes = [0u8; 12];
+    rng.fill(&mut nonce_bytes).map_err(|_| CryptoError::Rand)?;
+    let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+
+    let mut in_out = conn.as_bytes().to_vec();
+    key.seal_in_place_append_tag(nonce, Aad::empty(), &mut in_out).map_err(|_| CryptoError::Encrypt)?;
+
+    let mut out = Vec::with_capacity(12 + in_out.len());
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&in_out);
+    Ok(to_hex(&out))
+}
+
+/// hexトークンから接続文字列を復号
+pub fn decrypt_conninfo_from_hex(token_hex: &str) -> Result<String, CryptoError> {
+    let mut data = from_hex(token_hex)?;
+    if data.len() < 12 + 16 { // nonce + 最小タグ
+        return Err(CryptoError::Decrypt);
+    }
+    let (nonce_bytes, mut ciphertext) = data.split_at_mut(12);
+    let key = LessSafeKey::new(UnboundKey::new(&aead::CHACHA20_POLY1305, &CONNINFO_KEY).map_err(|_| CryptoError::Key)?);
+    let nonce = Nonce::assume_unique_for_key(nonce_bytes.try_into().map_err(|_| CryptoError::Decrypt)?);
+    let plain = key.open_in_place(nonce, Aad::empty(), &mut ciphertext).map_err(|_| CryptoError::Decrypt)?;
+    let s = std::str::from_utf8(plain).map_err(|_| CryptoError::Decrypt)?;
+    Ok(s.to_string())
 }
