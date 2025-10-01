@@ -12,6 +12,26 @@ fn current_unix_millis() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
+// コマンド仕様（説明・使い方）
+#[derive(Clone, Copy)]
+struct CommandSpec { name: &'static str, description: &'static str, usage: &'static str }
+const COMMANDS: &[CommandSpec] = &[
+    CommandSpec { name: "/help", description: "コマンド一覧または詳細を表示", usage: "/help [name]" },
+    CommandSpec { name: "/open", description: "ローカルで待受を開始し、トークンを表示", usage: "/open <port>" },
+    CommandSpec { name: "/close", description: "待受を終了", usage: "/close" },
+    CommandSpec { name: "/connect", description: "トークンで接続", usage: "/connect <token>" },
+    CommandSpec { name: "/disconnect", description: "接続を切断", usage: "/disconnect <id>" },
+    CommandSpec { name: "/peers", description: "接続中のピア一覧を表示", usage: "/peers" },
+    CommandSpec { name: "/certs", description: "ピア証明書（公開鍵）一覧を表示", usage: "/certs" },
+    CommandSpec { name: "/cert", description: "指定ピアの公開鍵詳細を表示", usage: "/cert <id>" },
+    CommandSpec { name: "/dm", description: "指定ピアにダイレクトメッセージを送信", usage: "/dm <to_id> <message>" },
+    CommandSpec { name: "/msg", description: "全体にメッセージを送信", usage: "/msg <message>" },
+    CommandSpec { name: "/handle", description: "自分のハンドル名を設定（@から始まり80文字未満）", usage: "/handle @name" },
+    CommandSpec { name: "/init", description: "署名鍵を生成して保存", usage: "/init" },
+    CommandSpec { name: "/exit", description: "アプリケーションを終了", usage: "/exit" },
+];
+fn find_command(name: &str) -> Option<&'static CommandSpec> { COMMANDS.iter().find(|c| c.name == name) }
+
 // 表示桁（全角=2, 半角=1 等）を考慮して安全に切り詰める
 fn display_width(s: &str) -> usize { unicode_width::UnicodeWidthStr::width(s) }
 fn truncate_display(s: &str, max_cols: usize) -> String {
@@ -60,7 +80,16 @@ fn build_signed_chat(text: &str, pkcs8: &[u8], pubk: &[u8]) -> Option<protocol::
 }
 // 署名付きDM
 fn build_signed_dm(text: &str, pkcs8: &[u8], pubk: &[u8]) -> Option<protocol::Message> {
-    let mut m = protocol::Message::dm(text, current_unix_millis());
+    let ts = current_unix_millis();
+    let ct = match crypto::encrypt_dm_payload(text.as_bytes()) { Ok(ct) => ct, Err(_) => return None };
+    let mut m = protocol::Message::dm("", ts);
+    m.payload = ct;
+    if let Ok(sig) = crypto::sign_ed25519(&protocol::signing_bytes(&m), pkcs8) { m = m.with_key_sig(pubk.to_vec(), sig); Some(m) } else { None }
+}
+
+// 署名付きHELLO（ハンドル付き）
+fn build_signed_hello(handle: &str, pkcs8: &[u8], pubk: &[u8]) -> Option<protocol::Message> {
+    let mut m = protocol::Message::hello_with_handle(current_unix_millis(), handle);
     if let Ok(sig) = crypto::sign_ed25519(&protocol::signing_bytes(&m), pkcs8) { m = m.with_key_sig(pubk.to_vec(), sig); Some(m) } else { None }
 }
 
@@ -75,6 +104,10 @@ fn main() {
     let mut messages: Vec<String> = Vec::new();
     let mut input = String::new();
     let mut running = true;
+    // ハンドル（@から始まり80文字未満）: 必須（デフォルト廃止）
+    let mut handle: String = config::get_value("user.handle")
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
 
     use crossterm::{execute, event};
     use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
@@ -93,22 +126,31 @@ fn main() {
         let (w, h) = terminal::size().unwrap_or((80,24));
         let safe_w = w.saturating_sub(1) as usize; // 末尾1桁は未使用にして自動折返しを回避
         let input_row = h.saturating_sub(1); // 最下行
-        let msg_area_rows = if h >= 2 { (h - 2) as usize } else { 0 }; // 上1行ステータス, 下1行入力
+    // メッセージ領域の高さは後続の view_h で計算
         // スクロールオフセット: 0 が最新。offset が増えると過去方向
-        let total = messages.len();
-        let view_h = msg_area_rows;
-        let max_scroll = total.saturating_sub(view_h);
-        let off = scroll_offset.min(max_scroll);
-        let mut start = 0usize; if total > view_h { start = total - view_h - off; }
+    // 旧カウントは flat_lines で再計算するため削除
         // 画面全消去は避けステータス+メッセージ領域のみクリア
         queue!(stdout, cursor::Hide).ok();
+        // '\n' を実際の改行として扱い、行ごとに表示するために平坦化
+        let mut flat_lines: Vec<String> = Vec::new();
+        for msg in messages.iter() {
+            for part in msg.split('\n') {
+                let mut s = part.to_string();
+                if display_width(&s) > safe_w { s = truncate_display(&s, safe_w); }
+                flat_lines.push(s);
+            }
+        }
+        let total = flat_lines.len();
+        let view_h = if input_row > 1 { (input_row - 1) as usize } else { 0 };
+        let max_scroll = total.saturating_sub(view_h);
+        let off = scroll_offset.min(max_scroll);
         // ステータスバークリア
         queue!(stdout, cursor::MoveTo(0,0), Clear(ClearType::CurrentLine)).ok();
         // ステータス文字列組み立て
         let bar_core = format!(" p2witter | スクロール:{}/{} ", off, max_scroll);
         let mut bar = bar_core.clone();
-    if !status_msg.is_empty() { bar.push_str(status_msg); }
-    if display_width(&bar) > safe_w { bar = truncate_display(&bar, safe_w); }
+        if !status_msg.is_empty() { bar.push_str(status_msg); }
+        if display_width(&bar) > safe_w { bar = truncate_display(&bar, safe_w); }
         queue!(stdout, cursor::MoveTo(0,0)).ok();
         // 反転表示 (端末対応簡易)
         queue!(stdout, style::SetAttribute(style::Attribute::Reverse)).ok();
@@ -116,9 +158,9 @@ fn main() {
         queue!(stdout, style::SetAttribute(style::Attribute::Reset)).ok();
         // メッセージ領域クリア & 描画 (y=1 .. input_row-1)
         for y in 1..input_row { queue!(stdout, cursor::MoveTo(0,y), Clear(ClearType::CurrentLine)).ok(); }
-        for (i, msg) in messages.iter().enumerate().skip(start) {
-            let y = (i-start) as u16 + 1; if y >= input_row { break; }
-            let mut line = msg.replace('\n', "\\n"); if display_width(&line) > safe_w { line = truncate_display(&line, safe_w); }
+        let mut start_idx = 0usize; if total > view_h { start_idx = total - view_h - off; }
+        for (i, line) in flat_lines.iter().enumerate().skip(start_idx) {
+            let y = (i-start_idx) as u16 + 1; if y >= input_row { break; }
             queue!(stdout, cursor::MoveTo(0,y)).ok(); let _ = write!(stdout, "{}", line);
         }
         (w,h)
@@ -155,7 +197,11 @@ fn main() {
     }
     let mut draw_state = DrawState::new();
     fn push_msg(messages: &mut Vec<String>, st: &mut DrawState, msg: String) { messages.push(msg); st.force_full = true; }
-    let mut status_msg = String::from("TUI開始。/open <port> または /connect <token>。/exit で終了。[F2: 選択/コピーモード切替]");
+    let mut status_msg = if handle.starts_with('@') && handle.chars().count() < 80 {
+        "TUI開始。/help でコマンド一覧。/open <port> または /connect <token>。/exit で終了。[F2: 選択/コピーモード切替]".into()
+    } else {
+        "ハンドル未設定です。/handle @name を先に実行してください".into()
+    };
 
     // スクロールと履歴状態
     let mut scroll_offset: usize = 0; // 0=最新 (一番下)。増えると過去へ。
@@ -240,8 +286,25 @@ fn main() {
                                 let parts: Vec<String> = line.split_whitespace().map(|s| s.to_string()).collect();
                                 // ローカルエコーは行わない (サーバ経由で戻る表示と二重防止)
                                 match parts.get(0).map(|s| s.as_str()) {
+                                    Some("/help") => {
+                                        if parts.len() >= 2 {
+                                            let target = &parts[1];
+                                            let key = if target.starts_with('/') { target.clone() } else { format!("/{}", target) };
+                                            if let Some(spec) = find_command(&key) {
+                                                let msg = format!("{}\n  説明: {}\n  使い方: {}", spec.name, spec.description, spec.usage);
+                                                push_msg(&mut messages, &mut draw_state, msg);
+                                            } else {
+                                                status_msg = format!("不明なコマンド: {} (/help で一覧)", key); draw_state.force_full = true;
+                                            }
+                                        } else {
+                                            let mut lines = vec!["コマンド一覧:".to_string()];
+                                            for c in COMMANDS.iter() { lines.push(format!("{:10} - {}", c.name, c.description)); }
+                                            push_msg(&mut messages, &mut draw_state, lines.join("\n"));
+                                        }
+                                    }
                                     Some("/open") => {
                                         if let Some(port) = parts.get(1) {
+                                            if !(handle.starts_with('@') && handle.chars().count() < 80) { status_msg = "ハンドル未設定です。/handle @name を先に実行してください".into(); draw_state.force_full = true; continue; }
                                             if active_thread_tx.is_none() {
                                                 let tx_main = tx_to_main.clone();
                                                 let (tx_thread, rx_thread) = mpsc::channel();
@@ -253,6 +316,7 @@ fn main() {
                                     }
                                     Some("/connect") => {
                                         if let Some(arg) = parts.get(1) {
+                                            if !(handle.starts_with('@') && handle.chars().count() < 80) { status_msg = "ハンドル未設定です。/handle @name を先に実行してください".into(); draw_state.force_full = true; continue; }
                                             if active_thread_tx.is_none() {
                                                 let tx_main = tx_to_main.clone();
                                                 let (tx_thread, rx_thread) = mpsc::channel();
@@ -265,6 +329,22 @@ fn main() {
                                             } else { arg.clone() };
                                             if let Some(ref tx) = active_thread_tx { tx.send(format!("/connect {}", token)).ok(); }
                                         } else { status_msg = "使い方: /connect <token>".into(); draw_state.force_full = true; }
+                                    }
+                                    Some("/handle") => {
+                                        if let Some(name) = parts.get(1) {
+                                            let valid = name.starts_with('@') && name.chars().count() < 80;
+                                            if valid {
+                                                handle = name.clone();
+                                                // 保存
+                                                let _ = config::upsert_value_and_save("user.handle", toml::Value::String(handle.clone()));
+                                                status_msg = format!("ハンドルを {} に設定", handle);
+                                                // ネットワークスレッドがあれば伝える
+                                                if let Some(ref tx) = active_thread_tx { let _ = tx.send(format!("/handle {}", handle)); }
+                                            } else {
+                                                status_msg = "使い方: /handle @name （@で開始し80文字未満）".into();
+                                            }
+                                            draw_state.force_full = true;
+                                        } else { status_msg = "使い方: /handle @name".into(); draw_state.force_full = true; }
                                     }
                                     
                                     Some("/exit") => {
@@ -295,17 +375,47 @@ fn main() {
                                     }
                                     Some("/dm") => {
                                         if parts.len() < 3 { status_msg = "使い方: /dm <to_id> <message>".into(); draw_state.force_full = true; }
-                                        else if let Some(ref tx) = active_thread_tx { let to_id=&parts[1]; let value=parts[2..].join(" "); tx.send(format!("/dm {} {}", to_id, value)).ok(); } else { status_msg = "ネットワークスレッドがありません。".into(); draw_state.force_full = true; }
+                                        else if let Some(ref tx) = active_thread_tx {
+                                            if !(handle.starts_with('@') && handle.chars().count() < 80) { status_msg = "ハンドル未設定です。/handle @name".into(); draw_state.force_full = true; continue; }
+                                            let to_id=&parts[1];
+                                            let value=parts[2..].join(" ");
+                                            // ローカルエコー
+                                            push_msg(&mut messages, &mut draw_state, format!("{}: {} ○", handle, value));
+                                            tx.send(format!("/dm {} {}", to_id, value)).ok();
+                                        } else { status_msg = "ネットワークスレッドがありません。".into(); draw_state.force_full = true; }
                                     }
                                     Some("/certs") => { if let Some(ref tx) = active_thread_tx { tx.send("/certs".into()).ok(); } else { status_msg = "ネットワークスレッドがありません。".into(); draw_state.force_full = true; } }
                                     Some("/cert") => { if parts.len()<2 { status_msg = "使い方: /cert <id>".into(); draw_state.force_full = true; } else if let Some(ref tx)=active_thread_tx { tx.send(format!("/cert {}", parts[1])).ok(); } else { status_msg = "ネットワークスレッドがありません。".into(); draw_state.force_full = true; } }
                                     Some("/msg") => {
                                         if parts.len() < 2 { status_msg = "使い方: /msg <message>".into(); draw_state.force_full = true; }
-                                        else if let Some(ref tx) = active_thread_tx { let value=parts[1..].join(" "); tx.send(format!("/msg {}", value)).ok(); } else { status_msg = "ネットワークスレッドがありません。".into(); draw_state.force_full = true; }
+                                        else if let Some(ref tx) = active_thread_tx {
+                                            if !(handle.starts_with('@') && handle.chars().count() < 80) { status_msg = "ハンドル未設定です。/handle @name".into(); draw_state.force_full = true; continue; }
+                                            let value=parts[1..].join(" ");
+                                            // ローカルエコー
+                                            push_msg(&mut messages, &mut draw_state, format!("{}: {} ○", handle, value));
+                                            tx.send(format!("/msg {}", value)).ok();
+                                        } else {
+                                            // ネットワークなしでもローカルエコーは行う
+                                            let value=parts[1..].join(" ");
+                                            push_msg(&mut messages, &mut draw_state, format!("{}: {} ○", handle, value));
+                                            status_msg = "ネットワークスレッドがありません。".into(); draw_state.force_full = true;
+                                        }
                                     }
                                     Some(other) => {
-                                        if other.starts_with('/') { status_msg = format!("不明なコマンド: {}", other); draw_state.force_full = true; }
-                                        else if let Some(ref tx) = active_thread_tx { tx.send(format!("/msg {}", line)).ok(); } else { status_msg = "ネットワークスレッドがありません。".into(); draw_state.force_full = true; }
+                                        if other.starts_with('/') {
+                                            let hint = if find_command(other).is_some() { "" } else { " (/help で一覧)" };
+                                            status_msg = format!("不明なコマンド: {}{}", other, hint); draw_state.force_full = true;
+                                        }
+                                        else if let Some(ref tx) = active_thread_tx {
+                                            if !(handle.starts_with('@') && handle.chars().count() < 80) { status_msg = "ハンドル未設定です。/handle @name".into(); draw_state.force_full = true; continue; }
+                                            // ローカルエコー
+                                            push_msg(&mut messages, &mut draw_state, format!("{}: {} ○", handle, line));
+                                            tx.send(format!("/msg {}", line)).ok();
+                                        } else {
+                                            // ネットワークなしでもローカルエコー
+                                            push_msg(&mut messages, &mut draw_state, format!("{}: {} ○", handle, line));
+                                            status_msg = "ネットワークスレッドがありません。".into(); draw_state.force_full = true;
+                                        }
                                     }
                                     None => {}
                                 }
@@ -371,9 +481,13 @@ fn run_network(tx_main: Sender<String>, rx_thread: Receiver<String>) {
     // 各 client ごとのデコーダ
     let mut decoders: Vec<protocol::Decoder> = Vec::new();
     #[derive(Clone, Debug)]
-    struct PeerMeta { public_key: Vec<u8>, last_valid: bool, last_timestamp: u64 }
+    struct PeerMeta { public_key: Vec<u8>, last_valid: bool, last_timestamp: u64, handle: Option<String> }
     let mut peer_meta: Vec<Option<PeerMeta>> = Vec::new();
     let mut buf = [0u8; 2048];
+    // ハンドル（必須）
+    let mut handle: String = config::get_value("user.handle")
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
 
     // 署名用鍵を読む (存在しなければ None)
     let mut pkcs8: Option<Vec<u8>> = None;
@@ -411,7 +525,21 @@ fn run_network(tx_main: Sender<String>, rx_thread: Receiver<String>) {
                 // トークンのみ受け付け。復号失敗ならエラー
                 let target = match crypto::decrypt_conninfo_from_hex(rest) { Ok(s) => s, Err(e) => { tx_main.send(format!("接続トークンの復号エラー: {}", e)).ok(); continue; } };
                 match TcpStream::connect(&target) {
-                    Ok(s) => { let s=s; s.set_nonblocking(true).ok(); clients.push(s); decoders.push(protocol::Decoder::new()); peer_meta.push(None); tx_main.send(format!("接続完了 (token={}) id={}", rest, clients.len()-1)).ok(); }
+                    Ok(s) => {
+                        let s = s; s.set_nonblocking(true).ok();
+                        clients.push(s);
+                        decoders.push(protocol::Decoder::new());
+                        peer_meta.push(None);
+                        let id = clients.len()-1;
+                        // 接続直後に公開鍵ハンドシェイクを送信
+                        if let (Some(pubk), Some(pk)) = (public.as_ref(), pkcs8.as_ref()) {
+                            if let Some(hello) = build_signed_hello(&handle, pk, pubk) {
+                                let frame = protocol::encode(&hello);
+                                let _ = clients[id].write_all(&frame);
+                            }
+                        }
+                        tx_main.send(format!("接続完了 (token={}) id={}", rest, id)).ok();
+                    }
                     Err(e) => { tx_main.send(format!("接続エラー (token={}): {:?}", rest, e)).ok(); }
                 }
             } else if cmd == "/close" {
@@ -461,10 +589,20 @@ fn run_network(tx_main: Sender<String>, rx_thread: Receiver<String>) {
                         }
                     } else { tx_main.send(format!("証明書: 不正な id {}", id)).ok(); }
                 } else { tx_main.send(format!("証明書: 解析エラー '{}'", rest)).ok(); }
+            } else if let Some(rest) = cmd.strip_prefix("/handle ") {
+                let name = rest.trim();
+                if name.starts_with('@') && name.chars().count() < 80 {
+                    handle = name.to_string();
+                    tx_main.send(format!("ハンドル適用: {}", handle)).ok();
+                } else {
+                    tx_main.send("/handle は @から始まり80文字未満".into()).ok();
+                }
             } else if let Some(rest) = cmd.strip_prefix("/msg ") {
                 // 送信メッセージをプロトコルフレーム化
                 if let (Some(ref pk), Some(ref pubk)) = (pkcs8.as_ref(), public.as_ref()) {
-                    if let Some(m) = build_signed_chat(rest, pk, pubk) {
+                    // 送信本文にハンドルをプレーンで含める
+                    let body = format!("{}: {}", handle, rest);
+                    if let Some(m) = build_signed_chat(&body, pk, pubk) {
                         let frame = protocol::encode(&m);
                         let mut remove = Vec::new();
                         for (i, c) in clients.iter_mut().enumerate() {
@@ -483,7 +621,8 @@ fn run_network(tx_main: Sender<String>, rx_thread: Receiver<String>) {
                 if let Ok(target) = to.parse::<usize>() {
                     if target < clients.len() {
                         if let (Some(ref pk), Some(ref pubk)) = (pkcs8.as_ref(), public.as_ref()) {
-                            if let Some(m) = build_signed_dm(msg_body, pk, pubk) {
+                            let body = format!("{}: {}", handle, msg_body);
+                            if let Some(m) = build_signed_dm(&body, pk, pubk) {
                                 let frame = protocol::encode(&m);
                                 if let Err(e) = clients[target].write_all(&frame) { tx_main.send(format!("DM送信エラー {}: {:?}", target, e)).ok(); }
                             } else { tx_main.send("DM署名生成失敗".into()).ok(); }
@@ -501,7 +640,22 @@ fn run_network(tx_main: Sender<String>, rx_thread: Receiver<String>) {
         if let Some(l) = &listener {
             loop {
                 match l.accept() {
-                    Ok((s, peer)) => { let s=s; s.set_nonblocking(true).ok(); clients.push(s); decoders.push(protocol::Decoder::new()); peer_meta.push(None); let token = crypto::encrypt_conninfo_to_hex(&peer.to_string()).unwrap_or_else(|_| "?".to_string()); tx_main.send(format!("接続受入 (token={}) id={}", token, clients.len()-1)).ok(); }
+                    Ok((s, peer)) => {
+                        let s = s; s.set_nonblocking(true).ok();
+                        clients.push(s);
+                        decoders.push(protocol::Decoder::new());
+                        peer_meta.push(None);
+                        // 受け入れ側も公開鍵を送信
+                        let id = clients.len()-1;
+                        if let (Some(pubk), Some(pk)) = (public.as_ref(), pkcs8.as_ref()) {
+                            if let Some(hello) = build_signed_hello(&handle, pk, pubk) {
+                                let frame = protocol::encode(&hello);
+                                let _ = clients[id].write_all(&frame);
+                            }
+                        }
+                        let token = crypto::encrypt_conninfo_to_hex(&peer.to_string()).unwrap_or_else(|_| "?".to_string());
+                        tx_main.send(format!("接続受入 (token={}) id={}", token, id)).ok();
+                    }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(e) => { tx_main.send(format!("受け入れエラー: {:?}", e)).ok(); break; }
                 }
@@ -522,25 +676,114 @@ fn run_network(tx_main: Sender<String>, rx_thread: Receiver<String>) {
 
         // 中継と表示 + 署名検証
         for (src, msg) in received_frames.iter() {
-            let txt = String::from_utf8_lossy(&msg.payload);
-            let mut signed_state = if msg.signature.is_some() { "署名あり" } else { "平文" };
+            // テキスト復号/デコード
+            let txt = if msg.kind == protocol::MsgKind::DM {
+                match crypto::decrypt_dm_payload(&msg.payload) {
+                    Ok(p) => String::from_utf8_lossy(&p).to_string(),
+                    Err(_) => "<DM復号エラー>".to_string(),
+                }
+            } else {
+                String::from_utf8_lossy(&msg.payload).to_string()
+            };
+            let mut signed_state = if msg.signature.is_some() { "○" } else { "・" };
             let mut good = true;
             if let (Some(sig), Some(pk)) = (msg.signature.as_ref(), msg.public_key.as_ref()) {
                 // 検証 (public_key & signature は署名対象外領域)
                 let minimal = protocol::Message { version: msg.version, kind: msg.kind, payload: msg.payload.clone(), timestamp: msg.timestamp, public_key: None, signature: None };
                 let data = protocol::signing_bytes(&minimal);
-                if crypto::verify_ed25519(&data, sig, pk).is_err() { signed_state = "署名不正"; good = false; }
-                // メタ更新
-                if *src < peer_meta.len() { peer_meta[*src] = Some(PeerMeta { public_key: pk.clone(), last_valid: good, last_timestamp: msg.timestamp }); }
+                if crypto::verify_ed25519(&data, sig, pk).is_err() { signed_state = "×"; good = false; }
+                // メタ更新（既存のハンドル情報は維持）
+                if *src < peer_meta.len() {
+                    let existing_handle = peer_meta[*src].as_ref().and_then(|m| m.handle.clone());
+                    peer_meta[*src] = Some(PeerMeta { public_key: pk.clone(), last_valid: good, last_timestamp: msg.timestamp, handle: existing_handle });
+                }
             }
-            if msg.kind == protocol::MsgKind::DM {
-                tx_main.send(format!("DM!! 送信元:{} {} [{}]", src, txt, signed_state)).ok();
+            if msg.kind == protocol::MsgKind::DISCONNECT {
+                let reason = protocol::disconnect_reason_id(msg).unwrap_or(0);
+                tx_main.send(format!("相手から切断通知 id={} reason={}", src, reason)).ok();
+                remove_indices.push(*src);
+            } else if msg.kind == protocol::MsgKind::HELLO {
+                // 相手の公開鍵が含まれていれば保存
+                if let Some(pk) = msg.public_key.as_ref() {
+                    // HELLO 自体の署名検証
+                    let minimal = protocol::Message { version: msg.version, kind: msg.kind, payload: msg.payload.clone(), timestamp: msg.timestamp, public_key: None, signature: None };
+                    let data = protocol::signing_bytes(&minimal);
+                    if let Some(sig) = msg.signature.as_ref() {
+                        if crypto::verify_ed25519(&data, sig, pk).is_err() {
+                            // 理由ID=3: HELLO署名不正
+                            let disc = protocol::Message::disconnect(current_unix_millis(), 3);
+                            let frame = protocol::encode(&disc);
+                            let _ = clients[*src].write_all(&frame);
+                            tx_main.send(format!("不正HELLO署名: id={} 切断", src)).ok();
+                            remove_indices.push(*src);
+                            continue;
+                        }
+                    } else {
+                        // 署名なし HELLO は不許可
+                        let disc = protocol::Message::disconnect(current_unix_millis(), 3);
+                        let frame = protocol::encode(&disc);
+                        let _ = clients[*src].write_all(&frame);
+                        tx_main.send(format!("HELLO署名なし: id={} 切断", src)).ok();
+                        remove_indices.push(*src);
+                        continue;
+                    }
+
+                    if *src < peer_meta.len() {
+                        let peer_handle = String::from_utf8_lossy(&msg.payload).to_string();
+                        let valid_handle = peer_handle.starts_with('@') && peer_handle.chars().count() < 80;
+                        if !valid_handle {
+                            let disc = protocol::Message::disconnect(current_unix_millis(), 2);
+                            let frame = protocol::encode(&disc);
+                            let _ = clients[*src].write_all(&frame);
+                            tx_main.send(format!("不正HELLO: id={} のハンドル '{}' が不正のため切断", src, peer_handle)).ok();
+                            remove_indices.push(*src);
+                        } else {
+                            let meta = PeerMeta { public_key: pk.clone(), last_valid: true, last_timestamp: msg.timestamp, handle: Some(peer_handle) };
+                            peer_meta[*src] = Some(meta);
+                        }
+                    }
+                    let d = ring::digest::digest(&ring::digest::SHA256, pk);
+                    let h = crypto::to_hex(d.as_ref());
+                    tx_main.send(format!("HELLO 受信: id={} 指紋={}", src, &h[..16])).ok();
+                } else {
+                    tx_main.send(format!("HELLO 受信: id={} (公開鍵なし)", src)).ok();
+                }
+            } else if msg.kind == protocol::MsgKind::DM {
+                // 受信表示: 本文 + 署名状態記号
+                let disp = format!("{} {}", txt, signed_state);
+                tx_main.send(disp).ok();
             } else {
-                tx_main.send(format!("受信(id={}): {} [{}]", src, txt, signed_state)).ok();
+                // 受信表示: 統一フォーマット（本文に '@handle: ' が含まれている想定）。
+                // 署名状態は末尾に半角スペース+記号を付ける。
+                let disp = if let Some(Some(meta)) = peer_meta.get(*src).cloned() {
+                    if meta.handle.is_some() { format!("{} {}", txt, signed_state) } else if txt.contains(':') { format!("{} {}", txt, signed_state) } else { format!("@{}: {} {}", src, txt, signed_state) }
+                } else if txt.contains(':') { format!("{} {}", txt, signed_state) } else { format!("@{}: {} {}", src, txt, signed_state) };
+                tx_main.send(disp).ok();
                 let frame = protocol::encode(msg);
                 for (idx, c) in clients.iter_mut().enumerate() {
                     if idx == *src { continue; }
                     if let Err(e) = c.write_all(&frame) { tx_main.send(format!("Relay write error to {}: {:?}", idx, e)).ok(); remove_indices.push(idx); }
+                }
+            }
+
+            // 不正検知: ハンドル長チェック（"@...: " のプレフィクスを解析）
+            if let Some(colon) = txt.find(':') {
+                let name = &txt[..colon].trim();
+                if name.starts_with('@') {
+                    let count = name.chars().count();
+                    if count >= 80 {
+                        // 切断: 理由ID=1（ハンドル長超過）
+                        let reason_id: u32 = 1;
+                        if *src < clients.len() {
+                            let disc = protocol::Message::disconnect(current_unix_millis(), reason_id);
+                            let frame = protocol::encode(&disc);
+                            let _ = clients[*src].write_all(&frame);
+                        }
+                        tx_main.send(format!("不正検知: id={} のハンドル長({})が制限超過のため切断", src, count)).ok();
+                        remove_indices.push(*src);
+                        // 次のメッセージ処理へ
+                        continue;
+                    }
                 }
             }
         }

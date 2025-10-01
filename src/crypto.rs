@@ -159,3 +159,34 @@ pub fn decrypt_conninfo_from_hex(token_hex: &str) -> Result<String, CryptoError>
     let s = std::str::from_utf8(plain).map_err(|_| CryptoError::Decrypt)?;
     Ok(s.to_string())
 }
+
+
+/// DMペイロード暗号化: バイト列 -> 先頭12Bノンス + 暗号文+タグ
+pub fn encrypt_dm_payload(plain: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    // CONNINFO_KEY を共有鍵として流用（デモ用途）。
+    // 形式は encrypt_conninfo_to_hex と同じ（ノンス12B先頭付与）。
+    let key = LessSafeKey::new(UnboundKey::new(&aead::CHACHA20_POLY1305, &CONNINFO_KEY).map_err(|_| CryptoError::Key)?);
+    let rng = SystemRandom::new();
+    let mut nonce_bytes = [0u8; 12];
+    rng.fill(&mut nonce_bytes).map_err(|_| CryptoError::Rand)?;
+    let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+
+    let mut in_out = plain.to_vec();
+    key.seal_in_place_append_tag(nonce, Aad::empty(), &mut in_out).map_err(|_| CryptoError::Encrypt)?;
+
+    let mut out = Vec::with_capacity(12 + in_out.len());
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&in_out);
+    Ok(out)
+}
+
+/// DMペイロード復号: 先頭12Bノンス + 暗号文+タグ -> 平文
+pub fn decrypt_dm_payload(nonce_and_ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    if nonce_and_ciphertext.len() < 12 + 16 { return Err(CryptoError::Decrypt); }
+    let mut buf = nonce_and_ciphertext.to_vec();
+    let (nonce_bytes, ciphertext) = buf.split_at_mut(12);
+    let key = LessSafeKey::new(UnboundKey::new(&aead::CHACHA20_POLY1305, &CONNINFO_KEY).map_err(|_| CryptoError::Key)?);
+    let nonce = Nonce::assume_unique_for_key(nonce_bytes.try_into().map_err(|_| CryptoError::Decrypt)?);
+    let plain = key.open_in_place(nonce, Aad::empty(), ciphertext).map_err(|_| CryptoError::Decrypt)?;
+    Ok(plain.to_vec())
+}

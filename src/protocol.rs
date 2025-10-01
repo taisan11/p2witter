@@ -10,6 +10,16 @@
 //! 22..(22+P): public key bytes
 //! (22+P)..(22+P+S): signature bytes
 //! (22+P+S)..(22+P+S+L): payload bytes (UTF-8 chat text)
+//! (22+P+S)..(22+P+S+L): payload bytes
+//!     - Chat(kind=1): UTF-8 text
+//!     - DM(kind=2):  ChaCha20-Poly1305 bytes = nonce(12B) || ciphertext || tag(16B)
+//!
+//! Signature (when present) is over: version || kind || payload_len(be) || timestamp || payload bytes.
+//! 公開鍵や署名サイズは署名対象外 (シンプル化)。
+
+//! Signature (when present) is over: version || kind || payload_len(be) || timestamp || payload bytes.
+//! 公開鍵や署名サイズは署名対象外 (シンプル化)。
+
 //!
 //! Signature (when present) is over: version || kind || payload_len(be) || payload bytes.
 //! 公開鍵や署名サイズは署名対象外 (シンプル化)。
@@ -24,6 +34,8 @@ pub struct MsgKind; // marker
 impl MsgKind {
     pub const CHAT: u8 = 1;
     pub const DM: u8 = 2; // ダイレクトメッセージ
+    pub const HELLO: u8 = 3; // 接続直後の公開鍵交換
+    pub const DISCONNECT: u8 = 4; // 切断通知（理由IDをpayloadに格納）
 }
 
 /// A decoded protocol message.
@@ -42,7 +54,17 @@ pub struct Message {
 impl Message {
     pub fn chat(text: &str, ts: u64) -> Self { Self { version: 1, kind: MsgKind::CHAT, payload: text.as_bytes().to_vec(), timestamp: ts, public_key: None, signature: None } }
     pub fn dm(text: &str, ts: u64) -> Self { Self { version: 1, kind: MsgKind::DM, payload: text.as_bytes().to_vec(), timestamp: ts, public_key: None, signature: None } }
+    pub fn hello(ts: u64) -> Self { Self { version: 1, kind: MsgKind::HELLO, payload: Vec::new(), timestamp: ts, public_key: None, signature: None } }
+    pub fn disconnect(ts: u64, reason_id: u32) -> Self {
+        let mut p = Vec::with_capacity(4);
+        p.extend_from_slice(&reason_id.to_be_bytes());
+        Self { version: 1, kind: MsgKind::DISCONNECT, payload: p, timestamp: ts, public_key: None, signature: None }
+    }
+    pub fn hello_with_handle(ts: u64, handle: &str) -> Self {
+        Self { version: 1, kind: MsgKind::HELLO, payload: handle.as_bytes().to_vec(), timestamp: ts, public_key: None, signature: None }
+    }
     pub fn with_key_sig(mut self, pk: Vec<u8>, sig: Vec<u8>) -> Self { self.public_key = Some(pk); self.signature = Some(sig); self }
+    pub fn with_key(mut self, pk: Vec<u8>) -> Self { self.public_key = Some(pk); self }
 }
 
 /// Errors that can occur during decoding.
@@ -116,7 +138,9 @@ impl Decoder {
             let version = self.buf[0];
             if version != 1 { return Err(ProtocolError::UnsupportedVersion(version)); }
             let kind_byte = self.buf[1];
-            if kind_byte != MsgKind::CHAT && kind_byte != MsgKind::DM { return Err(ProtocolError::UnsupportedVersion(kind_byte)); }
+            if kind_byte != MsgKind::CHAT && kind_byte != MsgKind::DM && kind_byte != MsgKind::HELLO && kind_byte != MsgKind::DISCONNECT {
+                return Err(ProtocolError::UnsupportedVersion(kind_byte));
+            }
             let payload_len = u32::from_be_bytes([self.buf[2], self.buf[3], self.buf[4], self.buf[5]]);
             if payload_len > self.max_payload { return Err(ProtocolError::LengthTooLarge(payload_len)); }
             let pk_len = u32::from_be_bytes([self.buf[6], self.buf[7], self.buf[8], self.buf[9]]);
@@ -152,4 +176,12 @@ pub fn signing_bytes(msg: &Message) -> Vec<u8> {
     v.extend_from_slice(&msg.timestamp.to_be_bytes());
     v.extend_from_slice(&msg.payload);
     v
+}
+
+/// 切断理由IDの取得（payload が4バイトである必要）。
+#[allow(dead_code)]
+pub fn disconnect_reason_id(msg: &Message) -> Option<u32> {
+    if msg.kind != MsgKind::DISCONNECT { return None; }
+    if msg.payload.len() < 4 { return None; }
+    Some(u32::from_be_bytes([msg.payload[0], msg.payload[1], msg.payload[2], msg.payload[3]]))
 }
