@@ -6,6 +6,7 @@ use std::time::Duration;
 mod protocol;
 mod config;
 mod crypto;
+mod storage;
 
 fn current_unix_millis() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -99,9 +100,12 @@ fn main() {
     let mut active_thread_tx: Option<Sender<String>> = None;
     let mut active_thread_handle: Option<thread::JoinHandle<()>> = None;
     if let Err(e) = config::init_config_path("./config.toml") { eprintln!("設定初期化に失敗: {e}"); }
+    // ストレージ初期化（sled）
+    let _ = storage::init_storage("./p2witter.db");
 
     // TUI 状態
     let mut messages: Vec<String> = Vec::new();
+    let mut past_messages: Vec<String> = Vec::new();
     let mut input = String::new();
     let mut running = true;
     // ハンドル（@から始まり80文字未満）: 必須（デフォルト廃止）
@@ -119,7 +123,7 @@ fn main() {
     // 差分描画用状態と関数 + スクロール/履歴状態 + ステータスバー
     struct DrawState { last_msg_len: usize, last_input_len: usize, last_cursor_pos: usize, force_full: bool }
     impl DrawState { fn new() -> Self { Self { last_msg_len: 0, last_input_len: 0, last_cursor_pos: 0, force_full: true } } }
-    fn redraw_full(stdout: &mut io::Stdout, messages: &Vec<String>, scroll_offset: usize, status_msg: &str) -> (u16,u16) {
+    fn redraw_full(stdout: &mut io::Stdout, messages: &Vec<String>, scroll_offset: usize, status_msg: &str, past_mode: bool, date_range: &str) -> (u16,u16) {
         use crossterm::{terminal, queue, cursor};
         use crossterm::terminal::{Clear, ClearType};
     use crossterm::style::{self};
@@ -147,7 +151,12 @@ fn main() {
         // ステータスバークリア
         queue!(stdout, cursor::MoveTo(0,0), Clear(ClearType::CurrentLine)).ok();
         // ステータス文字列組み立て
-        let bar_core = format!(" p2witter | スクロール:{}/{} ", off, max_scroll);
+    let bar_core = if past_mode {
+        let range = if date_range.is_empty() { "過去ログ".into() } else { date_range.to_string() };
+        format!(" p2witter | {} (scroll {} / {}) ", range, off, max_scroll)
+    } else {
+        format!(" p2witter | スクロール:{}/{} ", off, max_scroll)
+    };
         let mut bar = bar_core.clone();
         if !status_msg.is_empty() { bar.push_str(status_msg); }
         if display_width(&bar) > safe_w { bar = truncate_display(&bar, safe_w); }
@@ -189,14 +198,25 @@ fn main() {
     let caret_x = if w == 0 { 0 } else { caret_cols_total.min(safe_w) } as u16;
     queue!(stdout, cursor::MoveTo(caret_x, y), cursor::Show).ok();
     }
-    fn render(stdout: &mut io::Stdout, messages: &Vec<String>, input: &str, st: &mut DrawState, scroll_offset: usize, status_msg: &str, cursor_pos: usize) {
+    fn render(stdout: &mut io::Stdout, messages: &Vec<String>, input: &str, st: &mut DrawState, scroll_offset: usize, status_msg: &str, cursor_pos: usize, past_mode: bool, date_range: &str) {
         let need_full = st.force_full || st.last_msg_len != messages.len();
-        if need_full { redraw_full(stdout, messages, scroll_offset, status_msg); st.last_msg_len = messages.len(); st.force_full = false; }
+        if need_full { redraw_full(stdout, messages, scroll_offset, status_msg, past_mode, date_range); st.last_msg_len = messages.len(); st.force_full = false; }
         if need_full || st.last_input_len != input.len() || st.last_cursor_pos != cursor_pos { redraw_input(stdout, input, cursor_pos); st.last_input_len = input.len(); st.last_cursor_pos = cursor_pos; }
         let _ = stdout.flush();
     }
     let mut draw_state = DrawState::new();
-    fn push_msg(messages: &mut Vec<String>, st: &mut DrawState, msg: String) { messages.push(msg); st.force_full = true; }
+    // 画面への追加のみ（保存しない）
+    fn push_msg(messages: &mut Vec<String>, st: &mut DrawState, msg: String) { 
+        messages.push(msg); 
+        st.force_full = true; 
+    }
+    // ユーザー投稿のみ保存するための専用関数
+    fn push_user_msg(messages: &mut Vec<String>, st: &mut DrawState, msg: String) {
+        let now = crate::current_unix_millis();
+        storage::append_message(now, &msg);
+        messages.push(msg);
+        st.force_full = true;
+    }
     // デバッグ専用ログ。config の debug=true のときのみ流す
     fn push_debug_msg(messages: &mut Vec<String>, st: &mut DrawState, msg: impl Into<String>) {
         if crate::config::is_debug() {
@@ -208,9 +228,15 @@ fn main() {
     } else {
         "ハンドル未設定です。/handle @name を先に実行してください".into()
     };
+    // 過去ログモード関連
+    let mut past_mode: bool = false; // 過去ログモード
+    let mut past_dates: Vec<String> = Vec::new();
+    let mut past_date_range: String = String::new();
+    let mut past_earliest_idx: Option<usize> = None; // 読み込み済みで最も古い day の past_dates index
 
     // スクロールと履歴状態
     let mut scroll_offset: usize = 0; // 0=最新 (一番下)。増えると過去へ。
+    let mut past_scroll_offset: usize = 0; // 過去ログ用の独立オフセット
     let mut history: Vec<String> = Vec::new();
     let mut history_pos: Option<usize> = None; // history 内のインデックス (0..len-1)。None は編集中の新規行。
     // VS Code 統合ターミナルでのマウス選択・コピー用モード
@@ -244,7 +270,9 @@ fn main() {
                                     }
                                     draw_state.force_full = true;
                                     // 復帰時に即再描画
-                                    render(&mut stdout, &messages, &input, &mut draw_state, scroll_offset, &status_msg, cursor_pos);
+                                    let view: &Vec<String> = if past_mode { &past_messages } else { &messages };
+                                    let off = if past_mode { past_scroll_offset } else { scroll_offset };
+                                    render(&mut stdout, view, &input, &mut draw_state, off, &status_msg, cursor_pos, past_mode, &past_date_range);
                                 }
                                 _ => { /* 選択の邪魔をしない */ }
                             }
@@ -262,7 +290,9 @@ fn main() {
                                 draw_state.force_full = true;
                                 copy_mode = true;
                                 // 案内を描画（この直後からはループ末尾の描画は抑止される）
-                                render(&mut stdout, &messages, &input, &mut draw_state, scroll_offset, &status_msg, cursor_pos);
+                                let view: &Vec<String> = if past_mode { &past_messages } else { &messages };
+                                let off = if past_mode { past_scroll_offset } else { scroll_offset };
+                                render(&mut stdout, view, &input, &mut draw_state, off, &status_msg, cursor_pos, past_mode, &past_date_range);
                             }
                             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => { running = false; }
                             KeyCode::Char(ch) => {
@@ -304,7 +334,13 @@ fn main() {
                                             }
                                         } else {
                                             let mut lines = vec!["コマンド一覧:".to_string()];
-                                            for c in COMMANDS.iter() { lines.push(format!("{:10} - {}", c.name, c.description)); }
+                                            for c in COMMANDS.iter() { 
+                                                if c.name == "/past" {
+                                                    lines.push(format!("{:10} - {}", c.name, "過去ログモードのON/OFFを切替。ONで最新日を読み込み。スクロール最上端到達で前日追加ロード"));
+                                                } else {
+                                                    lines.push(format!("{:10} - {}", c.name, c.description));
+                                                }
+                                            }
                                             push_msg(&mut messages, &mut draw_state, lines.join("\n"));
                                         }
                                     }
@@ -353,6 +389,45 @@ fn main() {
                                         } else { status_msg = "使い方: /handle @name".into(); draw_state.force_full = true; }
                                     }
                                     
+                                    Some("/past") => {
+                                        if past_mode {
+                                            // モード OFF
+                                            past_mode = false;
+                                            status_msg = "過去ログモード終了".into();
+                                            draw_state.force_full = true;
+                                            // スクロールは通常表示側を採用
+                                            // 過去ログ側は保持
+                                        } else {
+                                        past_mode = true; // モード ON
+                                        past_dates = storage::list_dates();
+                                        past_dates.sort();
+                                        // 最新日付のみロードし、date_range を設定
+                                        if let Some(last_idx) = past_dates.len().checked_sub(1) {
+                                            let day = &past_dates[last_idx];
+                                            // 構造化読み込みに切替
+                                            let recs = storage::load_structured_day(day);
+                                            past_messages.clear();
+                                            past_scroll_offset = 0;
+                                            for r in recs {
+                                                // 表示用フォーマット: 可能ならハンドル、なければ from_peer_id で擬似表記
+                                                let line = if r.handle.is_some() {
+                                                    format!("{} {}", r.text, if r.signed_ok == Some(true) { "○" } else { "・" })
+                                                } else if let Some(pid) = r.from_peer_id {
+                                                    format!("@{}: {} {}", pid, r.text, if r.signed_ok == Some(true) { "○" } else { "・" })
+                                                } else {
+                                                    r.text
+                                                };
+                                                past_messages.push(line);
+                                            }
+                                            past_date_range = format!("{}~{}", day, day);
+                                            past_earliest_idx = Some(last_idx);
+                                            status_msg = format!("過去ログモード {}", past_date_range);
+                                        } else {
+                                            status_msg = "過去ログなし".into();
+                                        }
+                                        draw_state.force_full = true;
+                                        }
+                                    }
                                     Some("/exit") => {
                                         status_msg = "終了中...".into(); draw_state.force_full = true;
                                         if let Some(ref tx) = active_thread_tx { tx.send("/exit".into()).ok(); drop(active_thread_tx.take()); }
@@ -385,8 +460,8 @@ fn main() {
                                             if !(handle.starts_with('@') && handle.chars().count() < 80) { status_msg = "ハンドル未設定です。/handle @name".into(); draw_state.force_full = true; continue; }
                                             let to_id=&parts[1];
                                             let value=parts[2..].join(" ");
-                                            // ローカルエコー
-                                            push_msg(&mut messages, &mut draw_state, format!("{}: {} ○", handle, value));
+                                            // ローカルエコー（ユーザー投稿は保存）
+                                            push_user_msg(&mut messages, &mut draw_state, format!("{}: {} ○", handle, value));
                                             tx.send(format!("/dm {} {}", to_id, value)).ok();
                                         } else { status_msg = "ネットワークスレッドがありません。".into(); draw_state.force_full = true; }
                                     }
@@ -397,13 +472,13 @@ fn main() {
                                         else if let Some(ref tx) = active_thread_tx {
                                             if !(handle.starts_with('@') && handle.chars().count() < 80) { status_msg = "ハンドル未設定です。/handle @name".into(); draw_state.force_full = true; continue; }
                                             let value=parts[1..].join(" ");
-                                            // ローカルエコー
-                                            push_msg(&mut messages, &mut draw_state, format!("{}: {} ○", handle, value));
+                                            // ローカルエコー（ユーザー投稿は保存）
+                                            push_user_msg(&mut messages, &mut draw_state, format!("{}: {} ○", handle, value));
                                             tx.send(format!("/msg {}", value)).ok();
                                         } else {
                                             // ネットワークなしでもローカルエコーは行う
                                             let value=parts[1..].join(" ");
-                                            push_msg(&mut messages, &mut draw_state, format!("{}: {} ○", handle, value));
+                                            push_user_msg(&mut messages, &mut draw_state, format!("{}: {} ○", handle, value));
                                             status_msg = "ネットワークスレッドがありません。".into(); draw_state.force_full = true;
                                         }
                                     }
@@ -414,12 +489,12 @@ fn main() {
                                         }
                                         else if let Some(ref tx) = active_thread_tx {
                                             if !(handle.starts_with('@') && handle.chars().count() < 80) { status_msg = "ハンドル未設定です。/handle @name".into(); draw_state.force_full = true; continue; }
-                                            // ローカルエコー
-                                            push_msg(&mut messages, &mut draw_state, format!("{}: {} ○", handle, line));
+                                            // ローカルエコー（ユーザー投稿は保存）
+                                            push_user_msg(&mut messages, &mut draw_state, format!("{}: {} ○", handle, line));
                                             tx.send(format!("/msg {}", line)).ok();
                                         } else {
                                             // ネットワークなしでもローカルエコー
-                                            push_msg(&mut messages, &mut draw_state, format!("{}: {} ○", handle, line));
+                                            push_user_msg(&mut messages, &mut draw_state, format!("{}: {} ○", handle, line));
                                             status_msg = "ネットワークスレッドがありません。".into(); draw_state.force_full = true;
                                         }
                                     }
@@ -457,8 +532,56 @@ fn main() {
                         if me.row == 0 { /* ステータス行: クリック等は今は無視 */ }
                         if me.row == input_row { continue; }
                         match me.kind {
-                            MouseEventKind::ScrollUp => { scroll_offset = scroll_offset.saturating_add(1); draw_state.force_full = true; }
-                            MouseEventKind::ScrollDown => { if scroll_offset > 0 { scroll_offset -= 1; draw_state.force_full = true; } }
+                            MouseEventKind::ScrollUp => {
+                                if past_mode { past_scroll_offset = past_scroll_offset.saturating_add(1); } else { scroll_offset = scroll_offset.saturating_add(1); }
+                                // 過去ログモードで最上端に到達したら前日を追加ロード
+                                if past_mode {
+                                    use crossterm::terminal;
+                                    if let (Some(earliest_idx), true) = (past_earliest_idx, true) {
+                                        if earliest_idx > 0 {
+                                            // 現在の最大スクロール量を概算: 行折返し考慮せず改行分割のみ
+                                            let (_w, h) = terminal::size().unwrap_or((80,24));
+                                            let view_h = h.saturating_sub(2) as usize; // (入力行 + ステータス行を除く)
+                                            let flat_len: usize = past_messages.iter().map(|m| m.split('\n').count()).sum();
+                                            let max_scroll = flat_len.saturating_sub(view_h);
+                                            if past_scroll_offset >= max_scroll { // 最上端にいる
+                                                let load_idx = earliest_idx - 1;
+                                                let day = &past_dates[load_idx];
+                                                let recs = storage::load_structured_day(day);
+                                                // 先頭に古い日を挿入（古→新）
+                                                let mut day_lines: Vec<String> = Vec::new();
+                                                for r in recs {
+                                                    let line = if r.handle.is_some() {
+                                                        format!("{} {}", r.text, if r.signed_ok == Some(true) { "○" } else { "・" })
+                                                    } else if let Some(pid) = r.from_peer_id {
+                                                        format!("@{}: {} {}", pid, r.text, if r.signed_ok == Some(true) { "○" } else { "・" })
+                                                    } else { r.text };
+                                                    day_lines.push(line);
+                                                }
+                                                let inserted = day_lines.len();
+                                                if inserted > 0 {
+                                                    // 先頭に挿入
+                                                    past_messages.splice(0..0, day_lines.into_iter());
+                                                    // 視点保持のため scroll_offset を行数ぶん加算
+                                                    past_scroll_offset = past_scroll_offset.saturating_add(inserted);
+                                                    past_earliest_idx = Some(load_idx);
+                                                    // 日付レンジ更新（開始日を差し替え）
+                                                    if let Some(pos) = past_date_range.find('~') {
+                                                        let end_part = past_date_range[pos+1..].to_string();
+                                                        past_date_range = format!("{}~{}", day, end_part);
+                                                    }
+                                                    status_msg = format!("過去ログ拡張 {}", past_date_range);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                draw_state.force_full = true;
+                            }
+                            MouseEventKind::ScrollDown => { 
+                                if past_mode { if past_scroll_offset > 0 { past_scroll_offset -= 1; draw_state.force_full = true; } }
+                                else { if scroll_offset > 0 { scroll_offset -= 1; draw_state.force_full = true; } }
+                            }
                             _ => {}
                         }
                     }
@@ -470,7 +593,9 @@ fn main() {
 
         // 選択/コピーモード中は描画更新を止め、選択が崩れないようにする
         if !copy_mode {
-            render(&mut stdout, &messages, &input, &mut draw_state, scroll_offset, &status_msg, cursor_pos);
+            let view: &Vec<String> = if past_mode { &past_messages } else { &messages };
+            let off = if past_mode { past_scroll_offset } else { scroll_offset };
+            render(&mut stdout, view, &input, &mut draw_state, off, &status_msg, cursor_pos, past_mode, &past_date_range);
         }
     }
 
@@ -614,6 +739,18 @@ fn run_network(tx_main: Sender<String>, rx_thread: Receiver<String>) {
                         for (i, c) in clients.iter_mut().enumerate() {
                             if let Err(e) = c.write_all(&frame) { tx_main.send(format!("送信エラー {}: {:?}", i, e)).ok(); remove.push(i); }
                         }
+                        // 保存（送信メタ）
+                        let rec = crate::storage::MessageRecord {
+                            ts_millis: m.timestamp,
+                            recv_ts_millis: crate::current_unix_millis(),
+                            kind: crate::storage::MsgKind::Chat,
+                            from_peer_id: None,
+                            to_peer_id: None,
+                            handle: Some(handle.clone()),
+                            text: body,
+                            signed_ok: Some(true),
+                        };
+                        let _ = crate::storage::store_structured(&rec);
                         for i in remove.into_iter().rev() { clients.remove(i); decoders.remove(i); }
                     } else { tx_main.send("署名生成失敗".into()).ok(); }
                 } else {
@@ -631,6 +768,18 @@ fn run_network(tx_main: Sender<String>, rx_thread: Receiver<String>) {
                             if let Some(m) = build_signed_dm(&body, pk, pubk) {
                                 let frame = protocol::encode(&m);
                                 if let Err(e) = clients[target].write_all(&frame) { tx_main.send(format!("DM送信エラー {}: {:?}", target, e)).ok(); }
+                                // 保存（送信メタ）
+                                let rec = crate::storage::MessageRecord {
+                                    ts_millis: m.timestamp,
+                                    recv_ts_millis: crate::current_unix_millis(),
+                                    kind: crate::storage::MsgKind::Dm,
+                                    from_peer_id: None,
+                                    to_peer_id: Some(target),
+                                    handle: Some(handle.clone()),
+                                    text: body,
+                                    signed_ok: Some(true),
+                                };
+                                let _ = crate::storage::store_structured(&rec);
                             } else { tx_main.send("DM署名生成失敗".into()).ok(); }
                         } else { tx_main.send("鍵未生成 (/init を先に実行)".into()).ok(); }
                     } else {
@@ -758,6 +907,18 @@ fn run_network(tx_main: Sender<String>, rx_thread: Receiver<String>) {
                 // 受信表示: 本文 + 署名状態記号
                 let disp = format!("{} {}", txt, signed_state);
                 tx_main.send(disp).ok();
+                // 保存（受信メタ）
+                let rec = crate::storage::MessageRecord {
+                    ts_millis: msg.timestamp,
+                    recv_ts_millis: crate::current_unix_millis(),
+                    kind: crate::storage::MsgKind::Dm,
+                    from_peer_id: Some(*src),
+                    to_peer_id: None,
+                    handle: peer_meta.get(*src).and_then(|m| m.as_ref()).and_then(|m| m.handle.clone()),
+                    text: txt.clone(),
+                    signed_ok: Some(signed_state == "○"),
+                };
+                let _ = crate::storage::store_structured(&rec);
             } else {
                 // 受信表示: 統一フォーマット（本文に '@handle: ' が含まれている想定）。
                 // 署名状態は末尾に半角スペース+記号を付ける。
@@ -765,6 +926,18 @@ fn run_network(tx_main: Sender<String>, rx_thread: Receiver<String>) {
                     if meta.handle.is_some() { format!("{} {}", txt, signed_state) } else if txt.contains(':') { format!("{} {}", txt, signed_state) } else { format!("@{}: {} {}", src, txt, signed_state) }
                 } else if txt.contains(':') { format!("{} {}", txt, signed_state) } else { format!("@{}: {} {}", src, txt, signed_state) };
                 tx_main.send(disp).ok();
+                // 保存（受信メタ）
+                let rec = crate::storage::MessageRecord {
+                    ts_millis: msg.timestamp,
+                    recv_ts_millis: crate::current_unix_millis(),
+                    kind: crate::storage::MsgKind::Chat,
+                    from_peer_id: Some(*src),
+                    to_peer_id: None,
+                    handle: peer_meta.get(*src).and_then(|m| m.as_ref()).and_then(|m| m.handle.clone()),
+                    text: txt.clone(),
+                    signed_ok: Some(signed_state == "○"),
+                };
+                let _ = crate::storage::store_structured(&rec);
                 let frame = protocol::encode(msg);
                 for (idx, c) in clients.iter_mut().enumerate() {
                     if idx == *src { continue; }
