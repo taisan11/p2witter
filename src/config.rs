@@ -28,7 +28,14 @@ fn default_toml_string() -> String {
     // 例: デフォルトでサーバーポート2234、ユーザー名未設定など
     let mut t = Table::new();
     t.insert("testconfig".into(), Value::String("kurowasa-nn".into()));
+    // デフォルトではデバッグログを無効
+    t.insert("debug".into(), Value::Boolean(false));
     t.to_string()
+}
+
+/// 設定ファイルの `debug` フラグを簡単に取得するヘルパ
+pub fn is_debug() -> bool {
+    get_value("debug").and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
 pub fn config() -> std::sync::RwLockReadGuard<'static, Table> {

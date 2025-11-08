@@ -197,6 +197,12 @@ fn main() {
     }
     let mut draw_state = DrawState::new();
     fn push_msg(messages: &mut Vec<String>, st: &mut DrawState, msg: String) { messages.push(msg); st.force_full = true; }
+    // デバッグ専用ログ。config の debug=true のときのみ流す
+    fn push_debug_msg(messages: &mut Vec<String>, st: &mut DrawState, msg: impl Into<String>) {
+        if crate::config::is_debug() {
+            push_msg(messages, st, format!("[DEBUG] {}", msg.into()));
+        }
+    }
     let mut status_msg = if handle.starts_with('@') && handle.chars().count() < 80 {
         "TUI開始。/help でコマンド一覧。/open <port> または /connect <token>。/exit で終了。[F2: 選択/コピーモード切替]".into()
     } else {
