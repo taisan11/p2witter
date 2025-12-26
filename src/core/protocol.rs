@@ -54,13 +54,13 @@ pub struct Message {
 impl Message {
     pub fn chat(text: &str, ts: u64) -> Self { Self { version: 1, kind: MsgKind::CHAT, payload: text.as_bytes().to_vec(), timestamp: ts, public_key: None, signature: None } }
     pub fn dm(text: &str, ts: u64) -> Self { Self { version: 1, kind: MsgKind::DM, payload: text.as_bytes().to_vec(), timestamp: ts, public_key: None, signature: None } }
-    pub fn hello(ts: u64) -> Self { Self { version: 1, kind: MsgKind::HELLO, payload: Vec::new(), timestamp: ts, public_key: None, signature: None } }
+    // pub fn hello(ts: u64) -> Self { Self { version: 1, kind: MsgKind::HELLO, payload: Vec::new(), timestamp: ts, public_key: None, signature: None } }
     pub fn disconnect(ts: u64, reason_id: u32) -> Self {
         let mut p = Vec::with_capacity(4);
         p.extend_from_slice(&reason_id.to_be_bytes());
         Self { version: 1, kind: MsgKind::DISCONNECT, payload: p, timestamp: ts, public_key: None, signature: None }
     }
-    pub fn hello_with_handle(ts: u64, handle: &str) -> Self {
+    pub fn hello(ts: u64, handle: &str) -> Self {
         Self { version: 1, kind: MsgKind::HELLO, payload: handle.as_bytes().to_vec(), timestamp: ts, public_key: None, signature: None }
     }
     pub fn with_key_sig(mut self, pk: Vec<u8>, sig: Vec<u8>) -> Self { self.public_key = Some(pk); self.signature = Some(sig); self }

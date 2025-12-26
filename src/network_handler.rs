@@ -2,7 +2,28 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{Receiver, Sender};
 use std::{thread, time::Duration};
-use crate::{build_signed_chat, build_signed_dm, build_signed_hello, config, crypto, current_unix_millis, protocol,rpc::Command};
+use crate::{config, crypto, current_unix_millis, protocol,rpc::Command};
+
+// いったんコピペ
+// ToDo: 後で展開する
+// 署名付きチャット送信 (全体ブロードキャスト) - 鍵必須
+fn build_signed_chat(text: &str, pkcs8: &[u8], pubk: &[u8]) -> Option<protocol::Message> {
+    let mut m = protocol::Message::chat(text, current_unix_millis());
+    if let Ok(sig) = crypto::sign_ed25519(&protocol::signing_bytes(&m), pkcs8) { m = m.with_key_sig(pubk.to_vec(), sig); Some(m) } else { None }
+}
+// 署名付きDM
+fn build_signed_dm(text: &str, pkcs8: &[u8], pubk: &[u8]) -> Option<protocol::Message> {
+    let ts = current_unix_millis();
+    let ct = match crypto::encrypt_dm_payload(text.as_bytes()) { Ok(ct) => ct, Err(_) => return None };
+    let mut m = protocol::Message::dm("", ts);
+    m.payload = ct;
+    if let Ok(sig) = crypto::sign_ed25519(&protocol::signing_bytes(&m), pkcs8) { m = m.with_key_sig(pubk.to_vec(), sig); Some(m) } else { None }
+}
+
+fn build_signed_hello(handle: &str, pkcs8: &[u8], pubk: &[u8]) -> Option<protocol::Message> {
+    let mut m = protocol::Message::hello(current_unix_millis(), handle);
+    if let Ok(sig) = crypto::sign_ed25519(&protocol::signing_bytes(&m), pkcs8) { m = m.with_key_sig(pubk.to_vec(), sig); Some(m) } else { None }
+}
 
 pub fn network_handler(tx_main: Sender<String>, rx_thread: Receiver<Command>) {
     tx_main.send("ネットワークスレッド開始".to_string()).ok();

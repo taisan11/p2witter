@@ -2,17 +2,13 @@ use std::io::{self, Write};
 use std::sync::mpsc::{self, Sender, Receiver};
 use std::thread::{self};
 use std::time::Duration;
-mod protocol;
 mod config;
-mod crypto;
 mod storage;
 mod network_handler;
-mod rpc;
-
-fn current_unix_millis() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
-}
+mod core;
+use core::{protocol, crypto, rpc};
+mod utils;
+use utils::current_unix_millis;
 
 // コマンド仕様（説明・使い方）
 #[derive(Clone, Copy)]
@@ -73,26 +69,6 @@ fn split_at_char(s: &str, idx: usize) -> (String, String) {
     let left: String = it.by_ref().take(idx).collect();
     let right: String = it.collect();
     (left, right)
-}
-
-// 署名付きチャット送信 (全体ブロードキャスト) - 鍵必須
-fn build_signed_chat(text: &str, pkcs8: &[u8], pubk: &[u8]) -> Option<protocol::Message> {
-    let mut m = protocol::Message::chat(text, current_unix_millis());
-    if let Ok(sig) = crypto::sign_ed25519(&protocol::signing_bytes(&m), pkcs8) { m = m.with_key_sig(pubk.to_vec(), sig); Some(m) } else { None }
-}
-// 署名付きDM
-fn build_signed_dm(text: &str, pkcs8: &[u8], pubk: &[u8]) -> Option<protocol::Message> {
-    let ts = current_unix_millis();
-    let ct = match crypto::encrypt_dm_payload(text.as_bytes()) { Ok(ct) => ct, Err(_) => return None };
-    let mut m = protocol::Message::dm("", ts);
-    m.payload = ct;
-    if let Ok(sig) = crypto::sign_ed25519(&protocol::signing_bytes(&m), pkcs8) { m = m.with_key_sig(pubk.to_vec(), sig); Some(m) } else { None }
-}
-
-// 署名付きHELLO（ハンドル付き）
-fn build_signed_hello(handle: &str, pkcs8: &[u8], pubk: &[u8]) -> Option<protocol::Message> {
-    let mut m = protocol::Message::hello_with_handle(current_unix_millis(), handle);
-    if let Ok(sig) = crypto::sign_ed25519(&protocol::signing_bytes(&m), pkcs8) { m = m.with_key_sig(pubk.to_vec(), sig); Some(m) } else { None }
 }
 
 fn main() {
