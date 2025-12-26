@@ -73,7 +73,7 @@ fn split_at_char(s: &str, idx: usize) -> (String, String) {
 
 fn main() {
     // ---- 初期セットアップ ----
-    let (tx_to_main, rx_from_threads): (Sender<String>, Receiver<String>) = mpsc::channel();
+    let (tx_to_main, rx_from_threads): (Sender<rpc::Event>, Receiver<rpc::Event>) = mpsc::channel();
     let mut active_thread_tx: Option<Sender<rpc::Command>> = None;
     let mut active_thread_handle: Option<thread::JoinHandle<()>> = None;
     if let Err(e) = config::init_config_path("./config.toml") { eprintln!("設定初期化に失敗: {e}"); }
@@ -225,7 +225,12 @@ fn main() {
 
     while running {
         // ネットワークからのメッセージ取り込み (先に集めてからイベント / 描画判定)
-    while let Ok(m) = rx_from_threads.try_recv() { push_msg(&mut messages, &mut draw_state, m); if scroll_offset == 0 { /* stay bottom */ } }
+    while let Ok(ev) = rx_from_threads.try_recv() {
+            match ev {
+                rpc::Event::Message(m) => { push_msg(&mut messages, &mut draw_state, m); if scroll_offset == 0 { /* stay bottom */ } }
+                rpc::Event::DebugMessage(m) => { push_debug_msg(&mut messages, &mut draw_state, m); }
+            }
+        }
 
         // イベント待ち (50ms)
         if event::poll(Duration::from_millis(50)).unwrap_or(false) {

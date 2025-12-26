@@ -13,10 +13,8 @@ pub enum Command {
     Chat(String),
 }
 
-// #[derive(Debug)]
-// enum Event {
-//     Connected(String),
-//     Message(String),
-//     PeerList(Vec<String>),
-//     Error(String),
-// }
+#[derive(Debug)]
+pub enum Event {
+    Message(String),
+    DebugMessage(String),
+}
