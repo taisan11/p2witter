@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 license-file = "LICENSE"
 
+[lib]
+name = "p2witter"
+path = "src/lib.rs"
+
 [dependencies]
 crossterm = "0.29.0"
 ring = "0.17.14"

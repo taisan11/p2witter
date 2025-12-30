@@ -361,3 +361,304 @@ pub fn disconnect_reason_id(msg: &Message) -> Option<u32> {
         msg.payload[3],
     ]))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_encode_decode_chat_message() {
+        let msg = Message::chat("Hello, P2Witter!", 1234567890);
+        let encoded = encode(&msg);
+        
+        let mut decoder = Decoder::new();
+        decoder.feed(&encoded);
+        let decoded = decoder.drain().unwrap();
+        
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].payload, msg.payload);
+        assert_eq!(decoded[0].kind, MsgKind::CHAT);
+        assert_eq!(decoded[0].timestamp, 1234567890);
+    }
+
+    #[test]
+    fn test_encode_decode_dm_message() {
+        let msg = Message::dm("Secret message", 9876543210);
+        let encoded = encode(&msg);
+        
+        let mut decoder = Decoder::new();
+        decoder.feed(&encoded);
+        let decoded = decoder.drain().unwrap();
+        
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].kind, MsgKind::DM);
+        assert_eq!(decoded[0].payload, msg.payload);
+    }
+
+    #[test]
+    fn test_encode_decode_with_signature() {
+        let mut msg = Message::chat("Signed message", 1111111111);
+        msg.public_key = Some(vec![1u8; 32]);
+        msg.signature = Some(vec![2u8; 64]);
+        
+        let encoded = encode(&msg);
+        
+        let mut decoder = Decoder::new();
+        decoder.feed(&encoded);
+        let decoded = decoder.drain().unwrap();
+        
+        assert_eq!(decoded[0].public_key.as_ref().unwrap().len(), 32);
+        assert_eq!(decoded[0].signature.as_ref().unwrap().len(), 64);
+        assert_eq!(decoded[0].payload, msg.payload);
+    }
+
+    #[test]
+    fn test_partial_message_buffering() {
+        let msg = Message::chat("Test", 100);
+        let encoded = encode(&msg);
+        
+        let mut decoder = Decoder::new();
+        
+        // 分割して送信（ヘッダの途中まで）
+        decoder.feed(&encoded[..10]);
+        assert_eq!(decoder.drain().unwrap().len(), 0); // まだ完全でない
+        
+        // 残りを送信
+        decoder.feed(&encoded[10..]);
+        let decoded = decoder.drain().unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].payload, msg.payload);
+    }
+
+    #[test]
+    fn test_multiple_messages_in_stream() {
+        let msg1 = Message::chat("First", 111);
+        let msg2 = Message::chat("Second", 222);
+        
+        let mut encoded = encode(&msg1);
+        encoded.extend_from_slice(&encode(&msg2));
+        
+        let mut decoder = Decoder::new();
+        decoder.feed(&encoded);
+        let decoded = decoder.drain().unwrap();
+        
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(String::from_utf8_lossy(&decoded[0].payload), "First");
+        assert_eq!(String::from_utf8_lossy(&decoded[1].payload), "Second");
+    }
+
+    #[test]
+    fn test_hello_message() {
+        let msg = Message::hello(5000, "@alice");
+        let encoded = encode(&msg);
+        
+        let mut decoder = Decoder::new();
+        decoder.feed(&encoded);
+        let decoded = decoder.drain().unwrap();
+        
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].kind, MsgKind::HELLO);
+        assert_eq!(String::from_utf8_lossy(&decoded[0].payload), "@alice");
+    }
+
+    #[test]
+    fn test_disconnect_message() {
+        let msg = Message::disconnect(6000, 42);
+        let encoded = encode(&msg);
+        
+        let mut decoder = Decoder::new();
+        decoder.feed(&encoded);
+        let decoded = decoder.drain().unwrap();
+        
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].kind, MsgKind::DISCONNECT);
+        
+        let reason = disconnect_reason_id(&decoded[0]);
+        assert_eq!(reason, Some(42));
+    }
+
+    #[test]
+    fn test_malformed_version() {
+        let mut invalid = vec![99u8]; // invalid version
+        invalid.extend_from_slice(&[0u8; 22]);
+        
+        let mut decoder = Decoder::new();
+        decoder.feed(&invalid);
+        let result = decoder.drain();
+        
+        assert!(matches!(result, Err(ProtocolError::UnsupportedVersion(99))));
+    }
+
+    #[test]
+    fn test_length_too_large() {
+        let mut msg = vec![1u8, 1u8, 0u8]; // version, kind, attenuation
+        msg.extend_from_slice(&(1u32 << 30).to_be_bytes()); // payload_len: 超大サイズ
+        msg.extend_from_slice(&0u32.to_be_bytes()); // pk_len: 0
+        msg.extend_from_slice(&0u32.to_be_bytes()); // sig_len: 0
+        msg.extend_from_slice(&0u64.to_be_bytes()); // timestamp: 0
+        
+        let mut decoder = Decoder::new();
+        decoder.feed(&msg);
+        let result = decoder.drain();
+        
+        assert!(matches!(result, Err(ProtocolError::LengthTooLarge(_))));
+    }
+
+    #[test]
+    fn test_bad_attenuation() {
+        let mut msg = vec![1u8, 1u8, 99u8]; // version, kind, bad attenuation (>50)
+        msg.extend_from_slice(&[0u8; 20]);
+        
+        let mut decoder = Decoder::new();
+        decoder.feed(&msg);
+        let result = decoder.drain();
+        
+        assert!(matches!(result, Err(ProtocolError::BadAttenuation(99))));
+    }
+
+    #[test]
+    fn test_signing_bytes() {
+        let msg = Message::chat("test payload", 9999);
+        let sig_bytes = signing_bytes(&msg);
+        
+        // 署名バイト列は: version(1) + kind(1) + payload_len(4) + timestamp(8) + payload
+        let expected_len = 1 + 1 + 4 + 8 + 12; // "test payload"は12文字
+        assert_eq!(sig_bytes.len(), expected_len);
+        
+        // バージョン確認
+        assert_eq!(sig_bytes[0], 1);
+        // kind確認
+        assert_eq!(sig_bytes[1], MsgKind::CHAT);
+    }
+
+    #[test]
+    fn test_attenuation_in_message() {
+        let mut msg = Message::chat("Attenuated", 7777);
+        msg.attenuation = 25;
+        
+        let encoded = encode(&msg);
+        let mut decoder = Decoder::new();
+        decoder.feed(&encoded);
+        let decoded = decoder.drain().unwrap();
+        
+        assert_eq!(decoded[0].attenuation, 25);
+    }
+
+    #[test]
+    fn test_empty_payload() {
+        let msg = Message::chat("", 1000);
+        let encoded = encode(&msg);
+        
+        let mut decoder = Decoder::new();
+        decoder.feed(&encoded);
+        let decoded = decoder.drain().unwrap();
+        
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].payload.len(), 0);
+    }
+
+    #[test]
+    fn test_large_payload() {
+        let large_text = "x".repeat(50000);
+        let msg = Message::chat(&large_text, 2000);
+        let encoded = encode(&msg);
+        
+        let mut decoder = Decoder::new();
+        decoder.feed(&encoded);
+        let decoded = decoder.drain().unwrap();
+        
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].payload.len(), 50000);
+    }
+
+    #[test]
+    fn test_message_without_signature() {
+        let msg = Message::chat("No signature", 3000);
+        let encoded = encode(&msg);
+        
+        let mut decoder = Decoder::new();
+        decoder.feed(&encoded);
+        let decoded = decoder.drain().unwrap();
+        
+        assert_eq!(decoded[0].public_key, None);
+        assert_eq!(decoded[0].signature, None);
+    }
+
+    #[test]
+    fn test_incremental_feeding() {
+        let msg1 = Message::chat("First", 111);
+        let msg2 = Message::chat("Second", 222);
+        
+        let mut encoded = encode(&msg1);
+        encoded.extend_from_slice(&encode(&msg2));
+        
+        let mut decoder = Decoder::new();
+        
+        // 1バイトずつ送信
+        for byte in &encoded {
+            decoder.feed(&[*byte]);
+        }
+        
+        let decoded = decoder.drain().unwrap();
+        assert_eq!(decoded.len(), 2);
+    }
+
+    #[test]
+    fn test_with_key_sig_builder() {
+        let msg = Message::chat("Builder test", 4000)
+            .with_key(vec![3u8; 32])
+            .with_key_sig(vec![4u8; 32], vec![5u8; 64]);
+        
+        let encoded = encode(&msg);
+        let mut decoder = Decoder::new();
+        decoder.feed(&encoded);
+        let decoded = decoder.drain().unwrap();
+        
+        assert_eq!(decoded[0].public_key.as_ref().unwrap().len(), 32);
+        assert_eq!(decoded[0].signature.as_ref().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn test_timestamp_preservation() {
+        let ts = 1701234567890u64;
+        let msg = Message::chat("Timestamp test", ts);
+        let encoded = encode(&msg);
+        
+        let mut decoder = Decoder::new();
+        decoder.feed(&encoded);
+        let decoded = decoder.drain().unwrap();
+        
+        assert_eq!(decoded[0].timestamp, ts);
+    }
+
+    #[test]
+    fn test_all_message_kinds() {
+        let chat = Message::chat("Chat", 1000);
+        let dm = Message::dm("DM", 2000);
+        let hello = Message::hello(3000, "@user");
+        let disconnect = Message::disconnect(4000, 1);
+        
+        assert_eq!(chat.kind, MsgKind::CHAT);
+        assert_eq!(dm.kind, MsgKind::DM);
+        assert_eq!(hello.kind, MsgKind::HELLO);
+        assert_eq!(disconnect.kind, MsgKind::DISCONNECT);
+    }
+
+    #[test]
+    fn test_decoder_buffer_state() {
+        let msg = Message::chat("Buffer", 5000);
+        let encoded = encode(&msg);
+        
+        let mut decoder = Decoder::new();
+        assert_eq!(decoder.buffered_len(), 0);
+        
+        decoder.feed(&encoded[..10]);
+        assert_eq!(decoder.buffered_len(), 10);
+        
+        decoder.feed(&encoded[10..]);
+        assert!(decoder.buffered_len() > 0); // Before drain
+        
+        let _ = decoder.drain();
+        assert_eq!(decoder.buffered_len(), 0); // After drain
+    }
+}
