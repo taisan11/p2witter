@@ -1,6 +1,6 @@
-use std::sync::{OnceLock, RwLock};
 use std::fs;
 use std::path::Path;
+use std::sync::{OnceLock, RwLock};
 use toml::{Table, Value};
 
 static CONFIG: OnceLock<RwLock<Table>> = OnceLock::new();
@@ -8,13 +8,19 @@ static CONFIG: OnceLock<RwLock<Table>> = OnceLock::new();
 /// パスを指定して初期化。ファイルが存在しなければデフォルトを書き出してから読む。
 /// すでに初期化済みなら何もしない。
 pub fn init_config_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    if CONFIG.get().is_some() { return Ok(()); }
+    if CONFIG.get().is_some() {
+        return Ok(());
+    }
     let p = Path::new(path);
     let content = if p.exists() {
         fs::read_to_string(p)?
     } else {
         let default = default_toml_string();
-        if let Some(parent) = p.parent() { if !parent.as_os_str().is_empty() { fs::create_dir_all(parent)?; } }
+        if let Some(parent) = p.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
         fs::write(p, &default)?;
         default
     };
@@ -35,11 +41,17 @@ fn default_toml_string() -> String {
 
 /// 設定ファイルの `debug` フラグを簡単に取得するヘルパ
 pub fn is_debug() -> bool {
-    get_value("debug").and_then(|v| v.as_bool()).unwrap_or(false)
+    get_value("debug")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 pub fn config() -> std::sync::RwLockReadGuard<'static, Table> {
-    CONFIG.get().expect("config not initialized. call init_config first.").read().expect("config lock poisoned")
+    CONFIG
+        .get()
+        .expect("config not initialized. call init_config first.")
+        .read()
+        .expect("config lock poisoned")
 }
 
 pub fn get_value(path: &str) -> Option<Value> {
@@ -65,13 +77,21 @@ pub fn upsert_value_and_save(path: &str, value: Value) -> Result<(), String> {
         let mut root = lock.write().map_err(|_| "config lock poisoned")?;
         let mut cur: &mut Table = &mut *root;
         let mut segments: Vec<&str> = path.split('.').collect();
-        if segments.is_empty() { return Err("empty path".into()); }
+        if segments.is_empty() {
+            return Err("empty path".into());
+        }
         while segments.len() > 1 {
             let seg = segments.remove(0);
-            let next = cur.entry(seg.to_string()).or_insert_with(|| Value::Table(Table::new()));
+            let next = cur
+                .entry(seg.to_string())
+                .or_insert_with(|| Value::Table(Table::new()));
             match next {
-                Value::Table(t) => { cur = t; }
-                _ => { return Err(format!("segment '{}' is not a table", seg)); }
+                Value::Table(t) => {
+                    cur = t;
+                }
+                _ => {
+                    return Err(format!("segment '{}' is not a table", seg));
+                }
             }
         }
         let last = segments.remove(0);
@@ -82,11 +102,16 @@ pub fn upsert_value_and_save(path: &str, value: Value) -> Result<(), String> {
     save().map_err(|e| format!("save failed: {}", e))?;
 
     // 保存先ファイルから再読み込みしてメモリ上の CONFIG を更新する
-    let content = fs::read_to_string("./config.toml").map_err(|e| format!("reload read failed: {}", e))?;
-    let table: Table = content.parse().map_err(|e| format!("reload parse failed: {}", e))?;
+    let content =
+        fs::read_to_string("./config.toml").map_err(|e| format!("reload read failed: {}", e))?;
+    let table: Table = content
+        .parse()
+        .map_err(|e| format!("reload parse failed: {}", e))?;
 
     if let Some(lock) = CONFIG.get() {
-        let mut root = lock.write().map_err(|_| "config lock poisoned".to_string())?;
+        let mut root = lock
+            .write()
+            .map_err(|_| "config lock poisoned".to_string())?;
         *root = table;
         Ok(())
     } else {

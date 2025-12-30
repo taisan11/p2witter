@@ -9,9 +9,9 @@
 //! verify_ed25519(b"hello", &sig, &keys.public)?;
 //!
 use ring::{
+    aead::{self, Aad, LessSafeKey, Nonce, UnboundKey},
     rand::{SecureRandom, SystemRandom},
     signature::{self, Ed25519KeyPair, KeyPair},
-    aead::{self, LessSafeKey, UnboundKey, Nonce, Aad},
 };
 
 #[derive(Debug)]
@@ -70,9 +70,15 @@ pub fn sign_ed25519(message: &[u8], pkcs8_private_key: &[u8]) -> Result<Vec<u8>,
 }
 
 /// Ed25519署名を検証
-pub fn verify_ed25519(message: &[u8], signature: &[u8], public_key: &[u8]) -> Result<(), CryptoError> {
+pub fn verify_ed25519(
+    message: &[u8],
+    signature: &[u8],
+    public_key: &[u8],
+) -> Result<(), CryptoError> {
     let verifier = signature::UnparsedPublicKey::new(&signature::ED25519, public_key);
-    verifier.verify(message, signature).map_err(|_| CryptoError::Verify)
+    verifier
+        .verify(message, signature)
+        .map_err(|_| CryptoError::Verify)
 }
 
 /// ランダムバイト列を生成 (鍵IDなどに利用)
@@ -122,23 +128,24 @@ fn hex_val(b: u8) -> Option<u8> {
 // 32バイト固定鍵（デモ用途・簡易用途）。実運用ではビルド時に差し替えるなど要配慮。
 // ここでは定数値を例として埋め込み。変更すると古いトークンは復号できなくなります。
 const CONNINFO_KEY: [u8; 32] = [
-    0x42,0x95,0xAE,0x10,0x2C,0x7D,0x3F,0x81,
-    0x19,0xA2,0x5B,0xCC,0xD3,0x0E,0x77,0x6A,
-    0x91,0x54,0x23,0x88,0x0F,0xDE,0x63,0x11,
-    0x90,0xAB,0xC4,0x55,0x66,0xE1,0x2D,0x3C,
+    0x42, 0x95, 0xAE, 0x10, 0x2C, 0x7D, 0x3F, 0x81, 0x19, 0xA2, 0x5B, 0xCC, 0xD3, 0x0E, 0x77, 0x6A,
+    0x91, 0x54, 0x23, 0x88, 0x0F, 0xDE, 0x63, 0x11, 0x90, 0xAB, 0xC4, 0x55, 0x66, 0xE1, 0x2D, 0x3C,
 ];
 
 /// addr:port などの接続文字列を暗号化し、hex文字列トークンとして返す。
 /// 形式: hex(nonce(12B) || ciphertext+tag)
 pub fn encrypt_conninfo_to_hex(conn: &str) -> Result<String, CryptoError> {
-    let key = LessSafeKey::new(UnboundKey::new(&aead::CHACHA20_POLY1305, &CONNINFO_KEY).map_err(|_| CryptoError::Key)?);
+    let key = LessSafeKey::new(
+        UnboundKey::new(&aead::CHACHA20_POLY1305, &CONNINFO_KEY).map_err(|_| CryptoError::Key)?,
+    );
     let rng = SystemRandom::new();
     let mut nonce_bytes = [0u8; 12];
     rng.fill(&mut nonce_bytes).map_err(|_| CryptoError::Rand)?;
     let nonce = Nonce::assume_unique_for_key(nonce_bytes);
 
     let mut in_out = conn.as_bytes().to_vec();
-    key.seal_in_place_append_tag(nonce, Aad::empty(), &mut in_out).map_err(|_| CryptoError::Encrypt)?;
+    key.seal_in_place_append_tag(nonce, Aad::empty(), &mut in_out)
+        .map_err(|_| CryptoError::Encrypt)?;
 
     let mut out = Vec::with_capacity(12 + in_out.len());
     out.extend_from_slice(&nonce_bytes);
@@ -149,30 +156,38 @@ pub fn encrypt_conninfo_to_hex(conn: &str) -> Result<String, CryptoError> {
 /// hexトークンから接続文字列を復号
 pub fn decrypt_conninfo_from_hex(token_hex: &str) -> Result<String, CryptoError> {
     let mut data = from_hex(token_hex)?;
-    if data.len() < 12 + 16 { // nonce + 最小タグ
+    if data.len() < 12 + 16 {
+        // nonce + 最小タグ
         return Err(CryptoError::Decrypt);
     }
     let (nonce_bytes, mut ciphertext) = data.split_at_mut(12);
-    let key = LessSafeKey::new(UnboundKey::new(&aead::CHACHA20_POLY1305, &CONNINFO_KEY).map_err(|_| CryptoError::Key)?);
-    let nonce = Nonce::assume_unique_for_key(nonce_bytes.try_into().map_err(|_| CryptoError::Decrypt)?);
-    let plain = key.open_in_place(nonce, Aad::empty(), &mut ciphertext).map_err(|_| CryptoError::Decrypt)?;
+    let key = LessSafeKey::new(
+        UnboundKey::new(&aead::CHACHA20_POLY1305, &CONNINFO_KEY).map_err(|_| CryptoError::Key)?,
+    );
+    let nonce =
+        Nonce::assume_unique_for_key(nonce_bytes.try_into().map_err(|_| CryptoError::Decrypt)?);
+    let plain = key
+        .open_in_place(nonce, Aad::empty(), &mut ciphertext)
+        .map_err(|_| CryptoError::Decrypt)?;
     let s = std::str::from_utf8(plain).map_err(|_| CryptoError::Decrypt)?;
     Ok(s.to_string())
 }
-
 
 /// DMペイロード暗号化: バイト列 -> 先頭12Bノンス + 暗号文+タグ
 pub fn encrypt_dm_payload(plain: &[u8]) -> Result<Vec<u8>, CryptoError> {
     // CONNINFO_KEY を共有鍵として流用（デモ用途）。
     // 形式は encrypt_conninfo_to_hex と同じ（ノンス12B先頭付与）。
-    let key = LessSafeKey::new(UnboundKey::new(&aead::CHACHA20_POLY1305, &CONNINFO_KEY).map_err(|_| CryptoError::Key)?);
+    let key = LessSafeKey::new(
+        UnboundKey::new(&aead::CHACHA20_POLY1305, &CONNINFO_KEY).map_err(|_| CryptoError::Key)?,
+    );
     let rng = SystemRandom::new();
     let mut nonce_bytes = [0u8; 12];
     rng.fill(&mut nonce_bytes).map_err(|_| CryptoError::Rand)?;
     let nonce = Nonce::assume_unique_for_key(nonce_bytes);
 
     let mut in_out = plain.to_vec();
-    key.seal_in_place_append_tag(nonce, Aad::empty(), &mut in_out).map_err(|_| CryptoError::Encrypt)?;
+    key.seal_in_place_append_tag(nonce, Aad::empty(), &mut in_out)
+        .map_err(|_| CryptoError::Encrypt)?;
 
     let mut out = Vec::with_capacity(12 + in_out.len());
     out.extend_from_slice(&nonce_bytes);
@@ -182,11 +197,18 @@ pub fn encrypt_dm_payload(plain: &[u8]) -> Result<Vec<u8>, CryptoError> {
 
 /// DMペイロード復号: 先頭12Bノンス + 暗号文+タグ -> 平文
 pub fn decrypt_dm_payload(nonce_and_ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-    if nonce_and_ciphertext.len() < 12 + 16 { return Err(CryptoError::Decrypt); }
+    if nonce_and_ciphertext.len() < 12 + 16 {
+        return Err(CryptoError::Decrypt);
+    }
     let mut buf = nonce_and_ciphertext.to_vec();
     let (nonce_bytes, ciphertext) = buf.split_at_mut(12);
-    let key = LessSafeKey::new(UnboundKey::new(&aead::CHACHA20_POLY1305, &CONNINFO_KEY).map_err(|_| CryptoError::Key)?);
-    let nonce = Nonce::assume_unique_for_key(nonce_bytes.try_into().map_err(|_| CryptoError::Decrypt)?);
-    let plain = key.open_in_place(nonce, Aad::empty(), ciphertext).map_err(|_| CryptoError::Decrypt)?;
+    let key = LessSafeKey::new(
+        UnboundKey::new(&aead::CHACHA20_POLY1305, &CONNINFO_KEY).map_err(|_| CryptoError::Key)?,
+    );
+    let nonce =
+        Nonce::assume_unique_for_key(nonce_bytes.try_into().map_err(|_| CryptoError::Decrypt)?);
+    let plain = key
+        .open_in_place(nonce, Aad::empty(), ciphertext)
+        .map_err(|_| CryptoError::Decrypt)?;
     Ok(plain.to_vec())
 }
