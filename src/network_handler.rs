@@ -1,9 +1,13 @@
 use crate::core::{crypto, protocol, rpc};
 use crate::{config, utils::current_unix_millis};
+use std::collections::{HashSet, VecDeque};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{Duration, sleep};
+
+const FULL_RELAY_ATTENUATION: u8 = 6;
+const SEEN_MESSAGE_CACHE_CAPACITY: usize = 4096;
 
 fn build_signed_chat(text: &str, pkcs8: &[u8], pubk: &[u8]) -> Option<protocol::Message> {
     let ts = current_unix_millis();
@@ -16,11 +20,15 @@ fn build_signed_chat(text: &str, pkcs8: &[u8], pubk: &[u8]) -> Option<protocol::
 fn build_signed_dm(text: &str, pkcs8: &[u8], pubk: &[u8]) -> Option<protocol::Message> {
     let ts = current_unix_millis();
     let encrypted = crypto::encrypt_dm_payload(text.as_bytes()).ok()?;
-    let encrypted_str = String::from_utf8_lossy(&encrypted).to_string();
-    let msg = protocol::Message::dm(&encrypted_str, ts);
+    let msg = protocol::Message::dm_bytes(encrypted, ts);
     let data = protocol::signing_bytes(&msg);
     let sig = crypto::sign_ed25519(&data, pkcs8).ok()?;
     Some(msg.with_key_sig(pubk.to_vec(), sig))
+}
+
+fn verify_signed_message(msg: &protocol::Message, sig: &[u8], pk: &[u8]) -> bool {
+    let data = protocol::signing_bytes(msg);
+    crypto::verify_ed25519(&data, sig, pk).is_ok()
 }
 
 fn build_signed_hello(handle: &str, pkcs8: &[u8], pubk: &[u8]) -> Option<protocol::Message> {
@@ -29,6 +37,88 @@ fn build_signed_hello(handle: &str, pkcs8: &[u8], pubk: &[u8]) -> Option<protoco
     let data = protocol::signing_bytes(&msg);
     let sig = crypto::sign_ed25519(&data, pkcs8).ok()?;
     Some(msg.with_key_sig(pubk.to_vec(), sig))
+}
+
+fn relay_probability_percent(attenuation: u8) -> u8 {
+    if attenuation <= FULL_RELAY_ATTENUATION {
+        return 100;
+    }
+    if attenuation >= protocol::MAX_ATTENUATION {
+        return 0;
+    }
+
+    let remaining = (protocol::MAX_ATTENUATION - attenuation) as u16;
+    let window = (protocol::MAX_ATTENUATION - FULL_RELAY_ATTENUATION) as u16;
+    ((remaining * 100) / window) as u8
+}
+
+fn relay_bucket(msg: &protocol::Message, src: usize, dst: usize) -> u8 {
+    let mut seed = msg.timestamp
+        ^ ((msg.kind as u64) << 56)
+        ^ ((msg.attenuation as u64) << 48)
+        ^ ((msg.payload.len() as u64) << 16)
+        ^ ((src as u64) << 8)
+        ^ (dst as u64);
+    if let Some(pk) = msg.public_key.as_ref() {
+        for (i, b) in pk.iter().take(8).enumerate() {
+            seed ^= (*b as u64) << (i * 8);
+        }
+    }
+    seed ^= seed << 13;
+    seed ^= seed >> 7;
+    seed ^= seed << 17;
+    (seed % 100) as u8
+}
+
+fn should_relay_to_peer(msg: &protocol::Message, src: usize, dst: usize) -> bool {
+    let chance = relay_probability_percent(msg.attenuation);
+    chance > 0 && relay_bucket(msg, src, dst) < chance
+}
+
+fn message_identity(msg: &protocol::Message) -> [u8; 32] {
+    let pk_len = msg.public_key.as_ref().map_or(0, |pk| pk.len());
+    let sig_len = msg.signature.as_ref().map_or(0, |sig| sig.len());
+    let mut v = Vec::with_capacity(18 + msg.payload.len() + pk_len + sig_len);
+    v.push(msg.version);
+    v.push(msg.kind);
+    v.extend_from_slice(&msg.timestamp.to_be_bytes());
+    v.extend_from_slice(&(msg.payload.len() as u32).to_be_bytes());
+    v.extend_from_slice(&msg.payload);
+    if let Some(pk) = msg.public_key.as_ref() {
+        v.extend_from_slice(&(pk.len() as u32).to_be_bytes());
+        v.extend_from_slice(pk);
+    } else {
+        v.extend_from_slice(&0u32.to_be_bytes());
+    }
+    if let Some(sig) = msg.signature.as_ref() {
+        v.extend_from_slice(&(sig.len() as u32).to_be_bytes());
+        v.extend_from_slice(sig);
+    } else {
+        v.extend_from_slice(&0u32.to_be_bytes());
+    }
+    let digest = ring::digest::digest(&ring::digest::SHA256, &v);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest.as_ref());
+    out
+}
+
+fn is_duplicate_message(
+    msg: &protocol::Message,
+    seen_messages: &mut HashSet<[u8; 32]>,
+    seen_order: &mut VecDeque<[u8; 32]>,
+) -> bool {
+    let id = message_identity(msg);
+    if seen_messages.contains(&id) {
+        return true;
+    }
+    seen_messages.insert(id);
+    seen_order.push_back(id);
+    if seen_order.len() > SEEN_MESSAGE_CACHE_CAPACITY {
+        if let Some(old) = seen_order.pop_front() {
+            seen_messages.remove(&old);
+        }
+    }
+    false
 }
 
 pub async fn network_handler(tx_main: Sender<rpc::Event>, mut rx_thread: Receiver<rpc::Command>) {
@@ -48,6 +138,8 @@ pub async fn network_handler(tx_main: Sender<rpc::Event>, mut rx_thread: Receive
         handle: Option<String>,
     }
     let mut peer_meta: Vec<Option<PeerMeta>> = Vec::new();
+    let mut seen_messages: HashSet<[u8; 32]> = HashSet::new();
+    let mut seen_order: VecDeque<[u8; 32]> = VecDeque::new();
     let mut buf = [0u8; 2048];
     // ハンドル（必須）
     let mut handle: String = config::get_value("user.handle")
@@ -431,9 +523,21 @@ pub async fn network_handler(tx_main: Sender<rpc::Event>, mut rx_thread: Receive
                 Ok(n) => {
                     if n > 0 {
                         decoders[idx].feed(&buf[..n]);
-                        if let Ok(mut msgs) = decoders[idx].drain() {
-                            for m in msgs.drain(..) {
-                                received_frames.push((idx, m));
+                        match decoders[idx].drain() {
+                            Ok(mut msgs) => {
+                                for m in msgs.drain(..) {
+                                    received_frames.push((idx, m));
+                                }
+                            }
+                            Err(e) => {
+                                tx_main
+                                    .send(rpc::Event::Message(format!(
+                                        "プロトコルエラー {}: {}",
+                                        idx, e
+                                    )))
+                                    .await
+                                    .ok();
+                                remove_indices.push(idx);
                             }
                         }
                     }
@@ -451,6 +555,11 @@ pub async fn network_handler(tx_main: Sender<rpc::Event>, mut rx_thread: Receive
 
         // 中継と表示 + 署名検証
         for (src, msg) in received_frames.iter() {
+            if (msg.kind == protocol::MsgKind::CHAT || msg.kind == protocol::MsgKind::DM)
+                && is_duplicate_message(msg, &mut seen_messages, &mut seen_order)
+            {
+                continue;
+            }
             // テキスト復号/デコード
             let txt = if msg.kind == protocol::MsgKind::DM {
                 match crypto::decrypt_dm_payload(&msg.payload) {
@@ -467,18 +576,7 @@ pub async fn network_handler(tx_main: Sender<rpc::Event>, mut rx_thread: Receive
             };
             let mut good = true;
             if let (Some(sig), Some(pk)) = (msg.signature.as_ref(), msg.public_key.as_ref()) {
-                // 検証 (public_key & signature は署名対象外領域)
-                let minimal = protocol::Message {
-                    version: msg.version,
-                    kind: msg.kind,
-                    attenuation: msg.attenuation,
-                    payload: msg.payload.clone(),
-                    timestamp: msg.timestamp,
-                    public_key: None,
-                    signature: None,
-                };
-                let data = protocol::signing_bytes(&minimal);
-                if crypto::verify_ed25519(&data, sig, pk).is_err() {
+                if !verify_signed_message(msg, sig, pk) {
                     signed_state = "×";
                     good = false;
                 }
@@ -507,18 +605,8 @@ pub async fn network_handler(tx_main: Sender<rpc::Event>, mut rx_thread: Receive
                 // 相手の公開鍵が含まれていれば保存
                 if let Some(pk) = msg.public_key.as_ref() {
                     // HELLO 自体の署名検証
-                    let minimal = protocol::Message {
-                        version: msg.version,
-                        kind: msg.kind,
-                        attenuation: msg.attenuation,
-                        payload: msg.payload.clone(),
-                        timestamp: msg.timestamp,
-                        public_key: None,
-                        signature: None,
-                    };
-                    let data = protocol::signing_bytes(&minimal);
                     if let Some(sig) = msg.signature.as_ref() {
-                        if crypto::verify_ed25519(&data, sig, pk).is_err() {
+                        if !verify_signed_message(msg, sig, pk) {
                             // 理由ID=3: HELLO署名不正
                             let disc = protocol::Message::disconnect(current_unix_millis(), 3);
                             let frame = protocol::encode(&disc);
@@ -650,11 +738,15 @@ pub async fn network_handler(tx_main: Sender<rpc::Event>, mut rx_thread: Receive
                 // DM は減衰せず、宛先に届いたら即中継終了
                 // それ以外は減衰値を中継時にカウントアップし、最大値50で打ち止め
                 let mut fwd = msg.clone();
-                if fwd.kind != protocol::MsgKind::DM && fwd.attenuation < 50 {
+                if fwd.kind != protocol::MsgKind::DM && fwd.attenuation < protocol::MAX_ATTENUATION
+                {
                     fwd.attenuation = fwd.attenuation.saturating_add(1);
                     let frame = protocol::encode(&fwd);
                     for (idx, c) in clients.iter_mut().enumerate() {
                         if idx == *src {
+                            continue;
+                        }
+                        if !should_relay_to_peer(&fwd, *src, idx) {
                             continue;
                         }
 
@@ -711,5 +803,51 @@ pub async fn network_handler(tx_main: Sender<rpc::Event>, mut rx_thread: Receive
         }
 
         sleep(Duration::from_millis(15)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_probability_is_monotonic() {
+        assert_eq!(relay_probability_percent(0), 100);
+        assert_eq!(relay_probability_percent(FULL_RELAY_ATTENUATION), 100);
+        assert_eq!(relay_probability_percent(protocol::MAX_ATTENUATION), 0);
+        assert!(relay_probability_percent(20) < relay_probability_percent(10));
+    }
+
+    #[test]
+    fn duplicate_detection_ignores_attenuation() {
+        let mut seen_messages: HashSet<[u8; 32]> = HashSet::new();
+        let mut seen_order: VecDeque<[u8; 32]> = VecDeque::new();
+        let mut msg = protocol::Message::chat("hello", 12345);
+        msg.public_key = Some(vec![7; 32]);
+        msg.signature = Some(vec![9; 64]);
+        assert!(!is_duplicate_message(
+            &msg,
+            &mut seen_messages,
+            &mut seen_order
+        ));
+
+        let mut replay = msg.clone();
+        replay.attenuation = 40;
+        assert!(is_duplicate_message(
+            &replay,
+            &mut seen_messages,
+            &mut seen_order
+        ));
+    }
+
+    #[test]
+    fn signed_dm_payload_is_binary_safe() {
+        let keys = crypto::generate_ed25519_keypair().unwrap();
+        let plain = "@alice: こんにちは";
+        let msg = build_signed_dm(plain, &keys.pkcs8, &keys.public).unwrap();
+
+        assert_eq!(msg.kind, protocol::MsgKind::DM);
+        let decrypted = crypto::decrypt_dm_payload(&msg.payload).unwrap();
+        assert_eq!(String::from_utf8_lossy(&decrypted), plain);
     }
 }
