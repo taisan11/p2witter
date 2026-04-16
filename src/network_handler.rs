@@ -1,53 +1,40 @@
-use crate::config;
 use crate::core::{crypto, protocol, rpc};
-use crate::utils::current_unix_millis;
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc::{Receiver, Sender};
-use std::{thread, time::Duration};
+use crate::{config, utils::current_unix_millis};
+use tokio::io::AsyncWriteExt;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::time::{Duration, sleep};
 
-// いったんコピペ
-// ToDo: 後で展開する
-// 署名付きチャット送信 (全体ブロードキャスト) - 鍵必須
 fn build_signed_chat(text: &str, pkcs8: &[u8], pubk: &[u8]) -> Option<protocol::Message> {
-    let mut m = protocol::Message::chat(text, current_unix_millis());
-    if let Ok(sig) = crypto::sign_ed25519(&protocol::signing_bytes(&m), pkcs8) {
-        m = m.with_key_sig(pubk.to_vec(), sig);
-        Some(m)
-    } else {
-        None
-    }
+    let ts = current_unix_millis();
+    let msg = protocol::Message::chat(text, ts);
+    let data = protocol::signing_bytes(&msg);
+    let sig = crypto::sign_ed25519(&data, pkcs8).ok()?;
+    Some(msg.with_key_sig(pubk.to_vec(), sig))
 }
-// 署名付きDM
+
 fn build_signed_dm(text: &str, pkcs8: &[u8], pubk: &[u8]) -> Option<protocol::Message> {
     let ts = current_unix_millis();
-    let ct = match crypto::encrypt_dm_payload(text.as_bytes()) {
-        Ok(ct) => ct,
-        Err(_) => return None,
-    };
-    let mut m = protocol::Message::dm("", ts);
-    m.payload = ct;
-    if let Ok(sig) = crypto::sign_ed25519(&protocol::signing_bytes(&m), pkcs8) {
-        m = m.with_key_sig(pubk.to_vec(), sig);
-        Some(m)
-    } else {
-        None
-    }
+    let encrypted = crypto::encrypt_dm_payload(text.as_bytes()).ok()?;
+    let encrypted_str = String::from_utf8_lossy(&encrypted).to_string();
+    let msg = protocol::Message::dm(&encrypted_str, ts);
+    let data = protocol::signing_bytes(&msg);
+    let sig = crypto::sign_ed25519(&data, pkcs8).ok()?;
+    Some(msg.with_key_sig(pubk.to_vec(), sig))
 }
 
 fn build_signed_hello(handle: &str, pkcs8: &[u8], pubk: &[u8]) -> Option<protocol::Message> {
-    let mut m = protocol::Message::hello(current_unix_millis(), handle);
-    if let Ok(sig) = crypto::sign_ed25519(&protocol::signing_bytes(&m), pkcs8) {
-        m = m.with_key_sig(pubk.to_vec(), sig);
-        Some(m)
-    } else {
-        None
-    }
+    let ts = current_unix_millis();
+    let msg = protocol::Message::hello(ts, handle);
+    let data = protocol::signing_bytes(&msg);
+    let sig = crypto::sign_ed25519(&data, pkcs8).ok()?;
+    Some(msg.with_key_sig(pubk.to_vec(), sig))
 }
 
-pub fn network_handler(tx_main: Sender<rpc::Event>, rx_thread: Receiver<rpc::Command>) {
+pub async fn network_handler(tx_main: Sender<rpc::Event>, mut rx_thread: Receiver<rpc::Command>) {
     tx_main
         .send(rpc::Event::Message("ネットワークスレッド開始".to_string()))
+        .await
         .ok();
     let mut listener: Option<TcpListener> = None;
     let mut clients: Vec<TcpStream> = Vec::new();
@@ -83,40 +70,34 @@ pub fn network_handler(tx_main: Sender<rpc::Event>, rx_thread: Receiver<rpc::Com
         }
     }
 
-    loop {
+    'main_loop: loop {
         // コマンド処理: drain できるだけ読む
         while let Ok(cmd) = rx_thread.try_recv() {
             match cmd {
-                rpc::Command::Shutdown => {
-                    tx_main
-                        .send(rpc::Event::Message(
-                            "Shutdown を受信 -> 終了します".to_string(),
-                        ))
-                        .ok();
-                    return;
-                }
                 rpc::Command::Open(port) => {
                     if listener.is_some() {
                         tx_main
                             .send(rpc::Event::Message(
                                 "既に待受中（/open は同時に1つまで）".into(),
                             ))
+                            .await
                             .ok();
                     } else {
-                        match TcpListener::bind(format!("127.0.0.1:{}", port)) {
+                        match TcpListener::bind(format!("127.0.0.1:{}", port)).await {
                             Ok(l) => {
-                                l.set_nonblocking(true).ok();
                                 listener = Some(l);
                                 let addr = format!("127.0.0.1:{}", port);
                                 let tok = crypto::encrypt_conninfo_to_hex(&addr)
                                     .unwrap_or_else(|_| "?".into());
                                 tx_main
                                     .send(rpc::Event::Message(format!("待受開始 (token={})", tok)))
+                                    .await
                                     .ok();
                             }
                             Err(e) => {
                                 tx_main
                                     .send(rpc::Event::Message(format!("バインドエラー: {:?}", e)))
+                                    .await
                                     .ok();
                             }
                         }
@@ -132,14 +113,13 @@ pub fn network_handler(tx_main: Sender<rpc::Event>, rx_thread: Receiver<rpc::Com
                                     "接続トークンの復号エラー: {}",
                                     e
                                 )))
+                                .await
                                 .ok();
                             continue;
                         }
                     };
-                    match TcpStream::connect(&target) {
+                    match TcpStream::connect(&target).await {
                         Ok(s) => {
-                            let s = s;
-                            s.set_nonblocking(true).ok();
                             clients.push(s);
                             decoders.push(protocol::Decoder::new());
                             peer_meta.push(None);
@@ -148,7 +128,7 @@ pub fn network_handler(tx_main: Sender<rpc::Event>, rx_thread: Receiver<rpc::Com
                             if let (Some(pubk), Some(pk)) = (public.as_ref(), pkcs8.as_ref()) {
                                 if let Some(hello) = build_signed_hello(&handle, pk, pubk) {
                                     let frame = protocol::encode(&hello);
-                                    let _ = clients[id].write_all(&frame);
+                                    let _ = clients[id].write_all(&frame).await;
                                 }
                             }
                             tx_main
@@ -156,6 +136,7 @@ pub fn network_handler(tx_main: Sender<rpc::Event>, rx_thread: Receiver<rpc::Com
                                     "接続完了 (token={}) id={}",
                                     token, id
                                 )))
+                                .await
                                 .ok();
                         }
                         Err(e) => {
@@ -164,19 +145,22 @@ pub fn network_handler(tx_main: Sender<rpc::Event>, rx_thread: Receiver<rpc::Com
                                     "接続エラー (token={}): {:?}",
                                     token, e
                                 )))
+                                .await
                                 .ok();
                         }
                     }
                 }
                 rpc::Command::Close => {
                     if listener.is_some() {
-                        listener = None;
+                        drop(listener.take());
                         tx_main
                             .send(rpc::Event::Message("待受を終了しました".into()))
+                            .await
                             .ok();
                     } else {
                         tx_main
                             .send(rpc::Event::Message("待受は起動していません".into()))
+                            .await
                             .ok();
                     }
                 }
@@ -188,10 +172,12 @@ pub fn network_handler(tx_main: Sender<rpc::Event>, rx_thread: Receiver<rpc::Com
                             peer_meta.remove(id);
                             tx_main
                                 .send(rpc::Event::Message(format!("切断しました id {}", id)))
+                                .await
                                 .ok();
                         } else {
                             tx_main
                                 .send(rpc::Event::Message(format!("切断: 不正な id {}", id)))
+                                .await
                                 .ok();
                         }
                     } else {
@@ -200,6 +186,7 @@ pub fn network_handler(tx_main: Sender<rpc::Event>, rx_thread: Receiver<rpc::Com
                                 "切断: 解析エラー '{}': 数値を指定してください",
                                 rest
                             )))
+                            .await
                             .ok();
                     }
                 }
@@ -228,7 +215,10 @@ pub fn network_handler(tx_main: Sender<rpc::Event>, rx_thread: Receiver<rpc::Com
                             .unwrap_or_else(|| "指紋=?".into());
                         lines.push(format!("id={} token={} {}", i, tok, fp));
                     }
-                    tx_main.send(rpc::Event::Message(lines.join("\n"))).ok();
+                    tx_main
+                        .send(rpc::Event::Message(lines.join("\n")))
+                        .await
+                        .ok();
                 }
                 rpc::Command::Certs => {
                     let mut lines = vec!["証明書:".to_string()];
@@ -249,19 +239,24 @@ pub fn network_handler(tx_main: Sender<rpc::Event>, rx_thread: Receiver<rpc::Com
                             None => lines.push(format!("id={} <鍵なし>", i)),
                         }
                     }
-                    tx_main.send(rpc::Event::Message(lines.join("\n"))).ok();
+                    tx_main
+                        .send(rpc::Event::Message(lines.join("\n")))
+                        .await
+                        .ok();
                 }
                 rpc::Command::Handle(name) => {
                     if name.starts_with('@') && name.chars().count() < 80 {
                         handle = name.clone();
                         tx_main
                             .send(rpc::Event::Message(format!("ハンドル適用: {}", handle)))
+                            .await
                             .ok();
                     } else {
                         tx_main
                             .send(rpc::Event::Message(
                                 "/handle は @から始まり80文字未満".into(),
                             ))
+                            .await
                             .ok();
                     }
                 }
@@ -274,12 +269,13 @@ pub fn network_handler(tx_main: Sender<rpc::Event>, rx_thread: Receiver<rpc::Com
                             let frame = protocol::encode(&m);
                             let mut remove = Vec::new();
                             for (i, c) in clients.iter_mut().enumerate() {
-                                if let Err(e) = c.write_all(&frame) {
+                                if let Err(e) = c.write_all(&frame).await {
                                     tx_main
                                         .send(rpc::Event::Message(format!(
                                             "送信エラー {}: {:?}",
                                             i, e
                                         )))
+                                        .await
                                         .ok();
                                     remove.push(i);
                                 }
@@ -303,11 +299,13 @@ pub fn network_handler(tx_main: Sender<rpc::Event>, rx_thread: Receiver<rpc::Com
                         } else {
                             tx_main
                                 .send(rpc::Event::Message("署名生成失敗".into()))
+                                .await
                                 .ok();
                         }
                     } else {
                         tx_main
                             .send(rpc::Event::Message("鍵未生成 (/init を先に実行)".into()))
+                            .await
                             .ok();
                     }
                 }
@@ -321,12 +319,13 @@ pub fn network_handler(tx_main: Sender<rpc::Event>, rx_thread: Receiver<rpc::Com
                                 let body = format!("{}: {}", handle, msg_body);
                                 if let Some(m) = build_signed_dm(&body, pk, pubk) {
                                     let frame = protocol::encode(&m);
-                                    if let Err(e) = clients[target].write_all(&frame) {
+                                    if let Err(e) = clients[target].write_all(&frame).await {
                                         tx_main
                                             .send(rpc::Event::Message(format!(
                                                 "DM送信エラー {}: {:?}",
                                                 target, e
                                             )))
+                                            .await
                                             .ok();
                                     }
                                     // 保存（送信メタ）
@@ -344,11 +343,13 @@ pub fn network_handler(tx_main: Sender<rpc::Event>, rx_thread: Receiver<rpc::Com
                                 } else {
                                     tx_main
                                         .send(rpc::Event::Message("DM署名生成失敗".into()))
+                                        .await
                                         .ok();
                                 }
                             } else {
                                 tx_main
                                     .send(rpc::Event::Message("鍵未生成 (/init を先に実行)".into()))
+                                    .await
                                     .ok();
                             }
                         } else {
@@ -357,51 +358,57 @@ pub fn network_handler(tx_main: Sender<rpc::Event>, rx_thread: Receiver<rpc::Com
                                     "DM 宛先 id {} が範囲外です",
                                     target
                                 )))
+                                .await
                                 .ok();
                         }
                     } else {
                         tx_main
                             .send(rpc::Event::Message(format!("不正な DM 宛先: {}", to_str)))
+                            .await
                             .ok();
                     }
+                }
+                rpc::Command::Shutdown => {
+                    tx_main
+                        .send(rpc::Event::Message("ネットワークスレッド終了".into()))
+                        .await
+                        .ok();
+                    break 'main_loop;
                 }
             }
         }
 
         // accept
         if let Some(l) = &listener {
-            loop {
-                match l.accept() {
-                    Ok((s, peer)) => {
-                        let s = s;
-                        s.set_nonblocking(true).ok();
-                        clients.push(s);
-                        decoders.push(protocol::Decoder::new());
-                        peer_meta.push(None);
-                        // 受け入れ側も公開鍵を送信
-                        let id = clients.len() - 1;
-                        if let (Some(pubk), Some(pk)) = (public.as_ref(), pkcs8.as_ref()) {
-                            if let Some(hello) = build_signed_hello(&handle, pk, pubk) {
-                                let frame = protocol::encode(&hello);
-                                let _ = clients[id].write_all(&frame);
-                            }
+            match l.accept().await {
+                Ok((s, peer)) => {
+                    clients.push(s);
+                    decoders.push(protocol::Decoder::new());
+                    peer_meta.push(None);
+                    // 受け入れ側も公開鍵を送信
+                    let id = clients.len() - 1;
+                    if let (Some(pubk), Some(pk)) = (public.as_ref(), pkcs8.as_ref()) {
+                        if let Some(hello) = build_signed_hello(&handle, pk, pubk) {
+                            let frame = protocol::encode(&hello);
+                            let _ = clients[id].write_all(&frame).await;
                         }
-                        let token = crypto::encrypt_conninfo_to_hex(&peer.to_string())
-                            .unwrap_or_else(|_| "?".to_string());
-                        tx_main
-                            .send(rpc::Event::Message(format!(
-                                "接続受入 (token={}) id={}",
-                                token, id
-                            )))
-                            .ok();
                     }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(e) => {
-                        tx_main
-                            .send(rpc::Event::Message(format!("受け入れエラー: {:?}", e)))
-                            .ok();
-                        break;
-                    }
+                    let token = crypto::encrypt_conninfo_to_hex(&peer.to_string())
+                        .unwrap_or_else(|_| "?".to_string());
+                    tx_main
+                        .send(rpc::Event::Message(format!(
+                            "接続受入 (token={}) id={}",
+                            token, id
+                        )))
+                        .await
+                        .ok();
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => {
+                    tx_main
+                        .send(rpc::Event::Message(format!("受け入れエラー: {:?}", e)))
+                        .await
+                        .ok();
                 }
             }
         }
@@ -410,13 +417,14 @@ pub fn network_handler(tx_main: Sender<rpc::Event>, rx_thread: Receiver<rpc::Com
         let mut received_frames: Vec<(usize, protocol::Message)> = Vec::new();
         let mut remove_indices: Vec<usize> = Vec::new();
         for (idx, c) in clients.iter_mut().enumerate() {
-            match c.read(&mut buf) {
+            match c.try_read(&mut buf) {
                 Ok(0) => {
                     tx_main
                         .send(rpc::Event::Message(format!(
                             "クライアント {} が切断しました",
                             idx
                         )))
+                        .await
                         .ok();
                     remove_indices.push(idx);
                 }
@@ -434,6 +442,7 @@ pub fn network_handler(tx_main: Sender<rpc::Event>, rx_thread: Receiver<rpc::Com
                 Err(e) => {
                     tx_main
                         .send(rpc::Event::Message(format!("受信エラー {}: {:?}", idx, e)))
+                        .await
                         .ok();
                     remove_indices.push(idx);
                 }
@@ -491,6 +500,7 @@ pub fn network_handler(tx_main: Sender<rpc::Event>, rx_thread: Receiver<rpc::Com
                         "相手から切断通知 id={} reason={}",
                         src, reason
                     )))
+                    .await
                     .ok();
                 remove_indices.push(*src);
             } else if msg.kind == protocol::MsgKind::HELLO {
@@ -512,12 +522,13 @@ pub fn network_handler(tx_main: Sender<rpc::Event>, rx_thread: Receiver<rpc::Com
                             // 理由ID=3: HELLO署名不正
                             let disc = protocol::Message::disconnect(current_unix_millis(), 3);
                             let frame = protocol::encode(&disc);
-                            let _ = clients[*src].write_all(&frame);
+                            let _ = clients[*src].write_all(&frame).await;
                             tx_main
                                 .send(rpc::Event::Message(format!(
                                     "不正HELLO署名: id={} 切断",
                                     src
                                 )))
+                                .await
                                 .ok();
                             remove_indices.push(*src);
                             continue;
@@ -526,12 +537,13 @@ pub fn network_handler(tx_main: Sender<rpc::Event>, rx_thread: Receiver<rpc::Com
                         // 署名なし HELLO は不許可
                         let disc = protocol::Message::disconnect(current_unix_millis(), 3);
                         let frame = protocol::encode(&disc);
-                        let _ = clients[*src].write_all(&frame);
+                        let _ = clients[*src].write_all(&frame).await;
                         tx_main
                             .send(rpc::Event::Message(format!(
                                 "HELLO署名なし: id={} 切断",
                                 src
                             )))
+                            .await
                             .ok();
                         remove_indices.push(*src);
                         continue;
@@ -544,12 +556,13 @@ pub fn network_handler(tx_main: Sender<rpc::Event>, rx_thread: Receiver<rpc::Com
                         if !valid_handle {
                             let disc = protocol::Message::disconnect(current_unix_millis(), 2);
                             let frame = protocol::encode(&disc);
-                            let _ = clients[*src].write_all(&frame);
+                            let _ = clients[*src].write_all(&frame).await;
                             tx_main
                                 .send(rpc::Event::Message(format!(
                                     "不正HELLO: id={} のハンドル '{}' が不正のため切断",
                                     src, peer_handle
                                 )))
+                                .await
                                 .ok();
                             remove_indices.push(*src);
                         } else {
@@ -570,6 +583,7 @@ pub fn network_handler(tx_main: Sender<rpc::Event>, rx_thread: Receiver<rpc::Com
                             src,
                             &h[..16]
                         )))
+                        .await
                         .ok();
                 } else {
                     tx_main
@@ -577,12 +591,13 @@ pub fn network_handler(tx_main: Sender<rpc::Event>, rx_thread: Receiver<rpc::Com
                             "HELLO 受信: id={} (公開鍵なし)",
                             src
                         )))
+                        .await
                         .ok();
                 }
             } else if msg.kind == protocol::MsgKind::DM {
                 // 受信表示: 本文 + 署名状態記号
                 let disp = format!("{} {}", txt, signed_state);
-                tx_main.send(rpc::Event::Message(disp)).ok();
+                tx_main.send(rpc::Event::Message(disp)).await.ok();
                 // 保存（受信メタ）
                 let rec = crate::storage::MessageRecord {
                     ts_millis: msg.timestamp,
@@ -614,7 +629,7 @@ pub fn network_handler(tx_main: Sender<rpc::Event>, rx_thread: Receiver<rpc::Com
                 } else {
                     format!("@{}: {} {}", src, txt, signed_state)
                 };
-                tx_main.send(rpc::Event::Message(disp)).ok();
+                tx_main.send(rpc::Event::Message(disp)).await.ok();
                 // 保存（受信メタ）
                 let rec = crate::storage::MessageRecord {
                     ts_millis: msg.timestamp,
@@ -643,12 +658,13 @@ pub fn network_handler(tx_main: Sender<rpc::Event>, rx_thread: Receiver<rpc::Com
                             continue;
                         }
 
-                        if let Err(e) = c.write_all(&frame) {
+                        if let Err(e) = c.write_all(&frame).await {
                             tx_main
                                 .send(rpc::Event::Message(format!(
                                     "Relay write error to {}: {:?}",
                                     idx, e
                                 )))
+                                .await
                                 .ok();
                             remove_indices.push(idx);
                         }
@@ -668,13 +684,14 @@ pub fn network_handler(tx_main: Sender<rpc::Event>, rx_thread: Receiver<rpc::Com
                             let disc =
                                 protocol::Message::disconnect(current_unix_millis(), reason_id);
                             let frame = protocol::encode(&disc);
-                            let _ = clients[*src].write_all(&frame);
+                            let _ = clients[*src].write_all(&frame).await;
                         }
                         tx_main
                             .send(rpc::Event::Message(format!(
                                 "不正検知: id={} のハンドル長({})が制限超過のため切断",
                                 src, count
                             )))
+                            .await
                             .ok();
                         remove_indices.push(*src);
                         // 次のメッセージ処理へ
@@ -693,6 +710,6 @@ pub fn network_handler(tx_main: Sender<rpc::Event>, rx_thread: Receiver<rpc::Com
             peer_meta.remove(i);
         }
 
-        thread::sleep(Duration::from_millis(15));
+        sleep(Duration::from_millis(15)).await;
     }
 }

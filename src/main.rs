@@ -1,12 +1,11 @@
 use std::io::{self, Write};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread::{self};
 use std::time::Duration;
+use tokio::sync::mpsc;
 mod config;
 mod core;
 mod network_handler;
 mod storage;
-use core::{crypto, protocol, rpc};
+use core::{crypto, rpc};
 mod utils;
 use utils::current_unix_millis;
 
@@ -110,6 +109,45 @@ fn truncate_display(s: &str, max_cols: usize) -> String {
     out
 }
 
+// 長いテキストを指定幅で折り返して複数行に分割
+fn wrap_text(s: &str, max_cols: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+    if max_cols == 0 {
+        return vec![s.to_string()];
+    }
+
+    let mut lines = Vec::new();
+    let mut current_line = String::new();
+    let mut current_width = 0usize;
+
+    for ch in s.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+
+        if current_width + ch_width > max_cols {
+            // 現在の行を保存して新しい行を開始
+            if !current_line.is_empty() {
+                lines.push(current_line.clone());
+                current_line.clear();
+                current_width = 0;
+            }
+        }
+
+        current_line.push(ch);
+        current_width += ch_width;
+    }
+
+    // 最後の行を追加
+    if !current_line.is_empty() {
+        lines.push(current_line);
+    }
+
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+
+    lines
+}
+
 // 末尾側（右端側）を優先して max_cols に収まる部分だけ取り出す（表示幅ベース）
 fn take_last_display(s: &str, max_cols: usize) -> String {
     use unicode_width::UnicodeWidthChar;
@@ -139,11 +177,13 @@ fn split_at_char(s: &str, idx: usize) -> (String, String) {
     (left, right)
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     // ---- 初期セットアップ ----
-    let (tx_to_main, rx_from_threads): (Sender<rpc::Event>, Receiver<rpc::Event>) = mpsc::channel();
-    let mut active_thread_tx: Option<Sender<rpc::Command>> = None;
-    let mut active_thread_handle: Option<thread::JoinHandle<()>> = None;
+    let (tx_to_main, mut rx_from_threads) = mpsc::channel::<rpc::Event>(100);
+    let mut active_thread_tx: Option<mpsc::Sender<rpc::Command>> = None;
+    let mut active_thread_handle: Option<tokio::task::JoinHandle<()>> = None;
+
     if let Err(e) = config::init_config_path("./config.toml") {
         eprintln!("設定初期化に失敗: {e}");
     }
@@ -209,14 +249,18 @@ fn main() {
         // 画面全消去は避けステータス+メッセージ領域のみクリア
         queue!(stdout, cursor::Hide).ok();
         // '\n' を実際の改行として扱い、行ごとに表示するために平坦化
+        // 長い行は unicode_width を使って適切に折り返す
         let mut flat_lines: Vec<String> = Vec::new();
         for msg in messages.iter() {
             for part in msg.split('\n') {
-                let mut s = part.to_string();
-                if display_width(&s) > safe_w {
-                    s = truncate_display(&s, safe_w);
+                if display_width(part) > safe_w {
+                    // 長い行は複数行に折り返す
+                    for wrapped_line in wrap_text(part, safe_w) {
+                        flat_lines.push(wrapped_line);
+                    }
+                } else {
+                    flat_lines.push(part.to_string());
                 }
-                flat_lines.push(s);
             }
         }
         let total = flat_lines.len();
@@ -408,6 +452,7 @@ fn main() {
                         if copy_mode {
                             match code {
                                 KeyCode::F(2) => {
+                                    push_debug_msg(&mut messages, &mut draw_state, "F2 push");
                                     copy_mode = false;
                                     // マウスキャプチャを再度有効化（失敗時はステータスに表示）
                                     if let Err(e) = execute!(stdout, EnableMouseCapture) {
@@ -600,17 +645,19 @@ fn main() {
                                             }
                                             if active_thread_tx.is_none() {
                                                 let tx_main = tx_to_main.clone();
-                                                let (tx_thread, rx_thread) = mpsc::channel();
-                                                let handle = thread::spawn(move || {
+                                                let (tx_thread, rx_thread) = mpsc::channel(100);
+                                                let handle_task = tokio::spawn(async move {
                                                     network_handler::network_handler(
                                                         tx_main, rx_thread,
-                                                    );
+                                                    )
+                                                    .await;
                                                 });
                                                 active_thread_tx = Some(tx_thread);
-                                                active_thread_handle = Some(handle);
+                                                active_thread_handle = Some(handle_task);
                                             }
                                             if let Some(ref tx) = active_thread_tx {
-                                                tx.send(rpc::Command::Open(port.clone())).ok();
+                                                let _ =
+                                                    tx.send(rpc::Command::Open(port.clone())).await;
                                             }
                                         } else {
                                             status_msg = "使い方: /open <port>".into();
@@ -628,14 +675,15 @@ fn main() {
                                             }
                                             if active_thread_tx.is_none() {
                                                 let tx_main = tx_to_main.clone();
-                                                let (tx_thread, rx_thread) = mpsc::channel();
-                                                let handle = thread::spawn(move || {
+                                                let (tx_thread, rx_thread) = mpsc::channel(100);
+                                                let handle_task = tokio::spawn(async move {
                                                     network_handler::network_handler(
                                                         tx_main, rx_thread,
-                                                    );
+                                                    )
+                                                    .await;
                                                 });
                                                 active_thread_tx = Some(tx_thread);
-                                                active_thread_handle = Some(handle);
+                                                active_thread_handle = Some(handle_task);
                                             }
                                             // 入力が平文アドレスなら自動でトークン化して送る
                                             let token = if arg.contains(':') {
@@ -647,7 +695,7 @@ fn main() {
                                                 arg.clone()
                                             };
                                             if let Some(ref tx) = active_thread_tx {
-                                                tx.send(rpc::Command::Connect(token)).ok();
+                                                let _ = tx.send(rpc::Command::Connect(token)).await;
                                             }
                                         } else {
                                             status_msg = "使い方: /connect <token>".into();
@@ -670,7 +718,8 @@ fn main() {
                                                 // ネットワークスレッドがあれば伝える
                                                 if let Some(ref tx) = active_thread_tx {
                                                     let _ = tx
-                                                        .send(rpc::Command::Handle(handle.clone()));
+                                                        .send(rpc::Command::Handle(handle.clone()))
+                                                        .await;
                                                 }
                                             } else {
                                                 status_msg =
@@ -746,11 +795,11 @@ fn main() {
                                         status_msg = "終了中...".into();
                                         draw_state.force_full = true;
                                         if let Some(ref tx) = active_thread_tx {
-                                            tx.send(rpc::Command::Shutdown).ok();
+                                            let _ = tx.send(rpc::Command::Shutdown).await;
                                             drop(active_thread_tx.take());
                                         }
                                         if let Some(handle) = active_thread_handle.take() {
-                                            handle.join().ok();
+                                            let _ = handle.await;
                                         }
                                         running = false;
                                     }
@@ -777,7 +826,7 @@ fn main() {
                                     },
                                     Some("/peers") => {
                                         if let Some(ref tx) = active_thread_tx {
-                                            tx.send(rpc::Command::PeerList).ok();
+                                            let _ = tx.send(rpc::Command::PeerList).await;
                                         } else {
                                             status_msg =
                                                 "ネットワークスレッドがありません。".into();
@@ -786,7 +835,7 @@ fn main() {
                                     }
                                     Some("/close") => {
                                         if let Some(ref tx) = active_thread_tx {
-                                            tx.send(rpc::Command::Close).ok();
+                                            let _ = tx.send(rpc::Command::Close).await;
                                         } else {
                                             status_msg =
                                                 "ネットワークスレッドがありません。".into();
@@ -798,8 +847,9 @@ fn main() {
                                             status_msg = "使い方: /disconnect <id>".into();
                                             draw_state.force_full = true;
                                         } else if let Some(ref tx) = active_thread_tx {
-                                            tx.send(rpc::Command::Disconnect(parts[1].clone()))
-                                                .ok();
+                                            let _ = tx
+                                                .send(rpc::Command::Disconnect(parts[1].clone()))
+                                                .await;
                                         } else {
                                             status_msg =
                                                 "ネットワークスレッドがありません。".into();
@@ -827,7 +877,9 @@ fn main() {
                                                 &mut draw_state,
                                                 format!("{}: {} ○", handle, value),
                                             );
-                                            tx.send(rpc::Command::DM(to_id.clone(), value)).ok();
+                                            let _ = tx
+                                                .send(rpc::Command::DM(to_id.clone(), value))
+                                                .await;
                                         } else {
                                             status_msg =
                                                 "ネットワークスレッドがありません。".into();
@@ -836,7 +888,7 @@ fn main() {
                                     }
                                     Some("/certs") => {
                                         if let Some(ref tx) = active_thread_tx {
-                                            tx.send(rpc::Command::Certs).ok();
+                                            let _ = tx.send(rpc::Command::Certs).await;
                                         } else {
                                             status_msg =
                                                 "ネットワークスレッドがありません。".into();
@@ -848,8 +900,9 @@ fn main() {
                                             status_msg = "使い方: /cert <id>".into();
                                             draw_state.force_full = true;
                                         } else if let Some(ref tx) = active_thread_tx {
-                                            tx.send(rpc::Command::Disconnect(parts[1].clone()))
-                                                .ok();
+                                            let _ = tx
+                                                .send(rpc::Command::Disconnect(parts[1].clone()))
+                                                .await;
                                         } else {
                                             status_msg =
                                                 "ネットワークスレッドがありません。".into();
@@ -876,7 +929,7 @@ fn main() {
                                                 &mut draw_state,
                                                 format!("{}: {} ○", handle, value),
                                             );
-                                            tx.send(rpc::Command::Chat(value)).ok();
+                                            let _ = tx.send(rpc::Command::Chat(value)).await;
                                         } else {
                                             // ネットワークなしでもローカルエコーは行う
                                             let value = parts[1..].join(" ");
@@ -915,7 +968,7 @@ fn main() {
                                                 &mut draw_state,
                                                 format!("{}: {} ○", handle, line),
                                             );
-                                            tx.send(rpc::Command::Chat(line.clone())).ok();
+                                            let _ = tx.send(rpc::Command::Chat(line.clone())).await;
                                         } else {
                                             // ネットワークなしでもローカルエコー
                                             push_user_msg(
