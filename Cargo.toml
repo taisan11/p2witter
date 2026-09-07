@@ -11,13 +11,14 @@ path = "src/lib.rs"
 [dependencies]
 crossterm = "0.29.0"
 ring = "0.17.14"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 sled = "0.34.7"
 toml = "0.9.8"
 unicode-width = "0.2.2"
 chrono = { version = "0.4", default-features = true }
 serde = { version = "1.0.228", features = ["derive"] }
 postcard = { version = "1.1.3", features = ["alloc"] }
-tokio = { version = "1.49.0", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+tokio = { version = "1.49.0", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "process"] }
 
 [profile.release]
 lto = true

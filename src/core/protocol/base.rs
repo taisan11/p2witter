@@ -1,4 +1,4 @@
-//! Binary protocol with optional Ed25519 signature + public key (Chat & DM) + timestamp.
+//! Binary protocol with optional Ed25519 signature + public key + timestamp.
 //!
 //! Frame layout (big endian for all multi-byte integers):
 //! - 0: version (u8)
@@ -73,34 +73,6 @@ pub struct Message {
 }
 
 impl Message {
-    pub fn chat(text: &str, ts: u64) -> Self {
-        Self {
-            version: PROTOCOL_VERSION,
-            kind: MsgKind::CHAT,
-            attenuation: 0,
-            payload: text.as_bytes().to_vec(),
-            timestamp: ts,
-            public_key: None,
-            signature: None,
-        }
-    }
-
-    pub fn dm(text: &str, ts: u64) -> Self {
-        Self::dm_bytes(text.as_bytes().to_vec(), ts)
-    }
-
-    pub fn dm_bytes(payload: Vec<u8>, ts: u64) -> Self {
-        Self {
-            version: PROTOCOL_VERSION,
-            kind: MsgKind::DM,
-            attenuation: 0,
-            payload,
-            timestamp: ts,
-            public_key: None,
-            signature: None,
-        }
-    }
-
     // pub fn hello(ts: u64) -> Self { Self { version: 1, kind: MsgKind::HELLO, attenuation: 0, payload: Vec::new(), timestamp: ts, public_key: None, signature: None } }
 
     pub fn disconnect(ts: u64, reason_id: u32) -> Self {
@@ -420,6 +392,15 @@ pub fn signing_bytes(msg: &Message) -> Vec<u8> {
 
     v.extend_from_slice(&msg.payload);
 
+    // 公開鍵を署名対象に含めることで、中継ノードが受信メッセージの
+    // 署名を剥ぎ取って自鍵で再署名し、発信者を偽装することを防ぐ。
+    if let Some(pk) = msg.public_key.as_ref() {
+        v.extend_from_slice(&(pk.len() as u32).to_be_bytes());
+        v.extend_from_slice(pk);
+    } else {
+        v.extend_from_slice(&0u32.to_be_bytes());
+    }
+
     v
 }
 
@@ -443,50 +424,6 @@ pub fn disconnect_reason_id(msg: &Message) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_encode_decode_chat_message() {
-        let msg = Message::chat("Hello, P2Witter!", 1234567890);
-        let encoded = encode(&msg);
-
-        let mut decoder = Decoder::new();
-        decoder.feed(&encoded);
-        let decoded = decoder.drain().unwrap();
-
-        assert_eq!(decoded.len(), 1);
-        assert_eq!(decoded[0].payload, msg.payload);
-        assert_eq!(decoded[0].kind, MsgKind::CHAT);
-        assert_eq!(decoded[0].timestamp, 1234567890);
-    }
-
-    #[test]
-    fn test_encode_decode_dm_message() {
-        let msg = Message::dm("Secret message", 9876543210);
-        let encoded = encode(&msg);
-
-        let mut decoder = Decoder::new();
-        decoder.feed(&encoded);
-        let decoded = decoder.drain().unwrap();
-
-        assert_eq!(decoded.len(), 1);
-        assert_eq!(decoded[0].kind, MsgKind::DM);
-        assert_eq!(decoded[0].payload, msg.payload);
-    }
-
-    #[test]
-    fn test_encode_decode_dm_binary_payload() {
-        let payload = vec![0, 159, 255, 1, 2, 3, 4];
-        let msg = Message::dm_bytes(payload.clone(), 777);
-        let encoded = encode(&msg);
-
-        let mut decoder = Decoder::new();
-        decoder.feed(&encoded);
-        let decoded = decoder.drain().unwrap();
-
-        assert_eq!(decoded.len(), 1);
-        assert_eq!(decoded[0].kind, MsgKind::DM);
-        assert_eq!(decoded[0].payload, payload);
-    }
 
     #[test]
     fn test_encode_decode_with_signature() {
@@ -702,7 +639,8 @@ mod tests {
         let sig_bytes = signing_bytes(&msg);
 
         // 署名バイト列は: version(1) + kind(1) + payload_len(4) + timestamp(8) + payload
-        let expected_len = 1 + 1 + 4 + 8 + 12; // "test payload"は12文字
+        // + pk_len(4, 公開鍵なしは0)
+        let expected_len = 1 + 1 + 4 + 8 + 12 + 4; // "test payload"は12文字、pk_len=0(4B)
         assert_eq!(sig_bytes.len(), expected_len);
 
         // バージョン確認

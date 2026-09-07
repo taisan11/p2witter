@@ -24,18 +24,23 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/open",
-        description: "ローカルで待受を開始し、トークンを表示",
-        usage: "/open <port>",
+        description: "ローカルで待受を開始し、トークンを表示（トンネル等の公開アドレスは [public-host] で指定）",
+        usage: "/open <port> [public-host]",
     },
     CommandSpec {
         name: "/close",
-        description: "待受を終了",
+        description: "待受を終了（トンネルも併せて終了）",
         usage: "/close",
     },
     CommandSpec {
         name: "/connect",
-        description: "トークンで接続",
+        description: "トークンで接続（生の host:port は指定不可）",
         usage: "/connect <token>",
+    },
+    CommandSpec {
+        name: "/tunnel",
+        description: "トンネルサービス経由で待受を開始（自動で /open を実行）",
+        usage: "/tunnel <ngrok|serveo> <port>",
     },
     CommandSpec {
         name: "/disconnect",
@@ -398,7 +403,7 @@ async fn main() {
         }
     }
     let mut status_msg = if handle.starts_with('@') && handle.chars().count() < 80 {
-        "TUI開始。/help でコマンド一覧。/open <port> または /connect <token>。/exit で終了。[F2: 選択/コピーモード切替]".into()
+        "TUI開始。/help でコマンド一覧。/open <port> [public-host] / /tunnel <ngrok|serveo> <port> / /connect <token>。/exit で終了。[F2: 選択/コピーモード切替]".into()
     } else {
         "ハンドル未設定です。/handle @name を先に実行してください".into()
     };
@@ -643,24 +648,44 @@ async fn main() {
                                                 draw_state.force_full = true;
                                                 continue;
                                             }
+                                            // ポート番号の検証: 1〜65535
+                                            match port.trim().parse::<u16>() {
+                                                Ok(p) if (1..=65535).contains(&p) => {}
+                                                _ => {
+                                                    status_msg =
+                                                        "ポート番号は 1〜65535 の範囲で指定してください".into();
+                                                    draw_state.force_full = true;
+                                                    continue;
+                                                }
+                                            }
                                             if active_thread_tx.is_none() {
                                                 let tx_main = tx_to_main.clone();
                                                 let (tx_thread, rx_thread) = mpsc::channel(100);
                                                 let handle_task = tokio::spawn(async move {
                                                     network_handler::network_handler(
-                                                        tx_main, rx_thread,
+                                                        tx_main,
+                                                        rx_thread,
+                                                        config::global().clone(),
+                                                        storage::global().clone(),
                                                     )
                                                     .await;
                                                 });
                                                 active_thread_tx = Some(tx_thread);
                                                 active_thread_handle = Some(handle_task);
                                             }
+                                            // 公開アドレス（トンネル端点等）は省略可
+                                            let public_host = parts.get(2).map(|s| s.clone());
                                             if let Some(ref tx) = active_thread_tx {
-                                                let _ =
-                                                    tx.send(rpc::Command::Open(port.clone())).await;
+                                                let _ = tx
+                                                    .send(rpc::Command::Open {
+                                                        port: port.clone(),
+                                                        public_host,
+                                                    })
+                                                    .await;
                                             }
                                         } else {
-                                            status_msg = "使い方: /open <port>".into();
+                                            status_msg =
+                                                "使い方: /open <port> [public-host]".into();
                                             draw_state.force_full = true;
                                         }
                                     }
@@ -678,27 +703,70 @@ async fn main() {
                                                 let (tx_thread, rx_thread) = mpsc::channel(100);
                                                 let handle_task = tokio::spawn(async move {
                                                     network_handler::network_handler(
-                                                        tx_main, rx_thread,
+                                                        tx_main,
+                                                        rx_thread,
+                                                        config::global().clone(),
+                                                        storage::global().clone(),
                                                     )
                                                     .await;
                                                 });
                                                 active_thread_tx = Some(tx_thread);
                                                 active_thread_handle = Some(handle_task);
                                             }
-                                            // 入力が平文アドレスなら自動でトークン化して送る
-                                            let token = if arg.contains(':') {
-                                                match crypto::encrypt_conninfo_to_hex(arg) {
-                                                    Ok(t) => t,
-                                                    Err(_) => arg.clone(),
-                                                }
-                                            } else {
-                                                arg.clone()
-                                            };
+                                            // 生の host:port は受け付けない。トークンのみ。
+                                            if arg.contains(':') {
+                                                status_msg =
+                                                    "生のアドレスは指定できません。/open で発行されたトークンを渡してください"
+                                                        .into();
+                                                draw_state.force_full = true;
+                                                continue;
+                                            }
                                             if let Some(ref tx) = active_thread_tx {
-                                                let _ = tx.send(rpc::Command::Connect(token)).await;
+                                                let _ =
+                                                    tx.send(rpc::Command::Connect(arg.clone())).await;
                                             }
                                         } else {
                                             status_msg = "使い方: /connect <token>".into();
+                                            draw_state.force_full = true;
+                                        }
+                                    }
+                                    Some("/tunnel") => {
+                                        if let (Some(provider), Some(port)) =
+                                            (parts.get(1), parts.get(2))
+                                        {
+                                            if !(handle.starts_with('@')
+                                                && handle.chars().count() < 80)
+                                            {
+                                                status_msg = "ハンドル未設定です。/handle @name を先に実行してください".into();
+                                                draw_state.force_full = true;
+                                                continue;
+                                            }
+                                            if active_thread_tx.is_none() {
+                                                let tx_main = tx_to_main.clone();
+                                                let (tx_thread, rx_thread) = mpsc::channel(100);
+                                                let handle_task = tokio::spawn(async move {
+                                                    network_handler::network_handler(
+                                                        tx_main,
+                                                        rx_thread,
+                                                        config::global().clone(),
+                                                        storage::global().clone(),
+                                                    )
+                                                    .await;
+                                                });
+                                                active_thread_tx = Some(tx_thread);
+                                                active_thread_handle = Some(handle_task);
+                                            }
+                                            if let Some(ref tx) = active_thread_tx {
+                                                let _ = tx
+                                                    .send(rpc::Command::Tunnel {
+                                                        provider: provider.clone(),
+                                                        port: port.clone(),
+                                                    })
+                                                    .await;
+                                            }
+                                        } else {
+                                            status_msg =
+                                                "使い方: /tunnel <ngrok|serveo> <port>".into();
                                             draw_state.force_full = true;
                                         }
                                     }
@@ -803,27 +871,44 @@ async fn main() {
                                         }
                                         running = false;
                                     }
-                                    Some("/init") => match crypto::generate_ed25519_keypair() {
-                                        Ok(k) => {
-                                            config::upsert_value_and_save(
-                                                "key.pkcs8",
-                                                toml::Value::String(crypto::to_hex(&k.pkcs8)),
-                                            )
-                                            .ok();
-                                            config::upsert_value_and_save(
-                                                "key.public",
-                                                toml::Value::String(crypto::to_hex(&k.public)),
-                                            )
-                                            .ok();
-                                            status_msg =
-                                                format!("鍵生成完了 public_len={}", k.public.len());
-                                            draw_state.force_full = true;
+                                    Some("/init") => {
+                                        match (
+                                            crypto::generate_ed25519_keypair(),
+                                            crypto::generate_x25519_keypair(),
+                                        ) {
+                                            (Ok(k), Ok((xk, xp))) => {
+                                                config::upsert_value_and_save(
+                                                    "key.pkcs8",
+                                                    toml::Value::String(crypto::to_hex(&k.pkcs8)),
+                                                )
+                                                .ok();
+                                                config::upsert_value_and_save(
+                                                    "key.public",
+                                                    toml::Value::String(crypto::to_hex(&k.public)),
+                                                )
+                                                .ok();
+                                                config::upsert_value_and_save(
+                                                    "key.x25519",
+                                                    toml::Value::String(crypto::to_hex(&xk)),
+                                                )
+                                                .ok();
+                                                config::upsert_value_and_save(
+                                                    "key.x25519_pub",
+                                                    toml::Value::String(crypto::to_hex(&xp)),
+                                                )
+                                                .ok();
+                                                status_msg = format!(
+                                                    "鍵生成完了 public_len={} (DM用X25519鍵も生成)",
+                                                    k.public.len()
+                                                );
+                                                draw_state.force_full = true;
+                                            }
+                                            _ => {
+                                                status_msg = "鍵生成失敗".to_string();
+                                                draw_state.force_full = true;
+                                            }
                                         }
-                                        Err(e) => {
-                                            status_msg = format!("鍵生成失敗: {e}");
-                                            draw_state.force_full = true;
-                                        }
-                                    },
+                                    }
                                     Some("/peers") => {
                                         if let Some(ref tx) = active_thread_tx {
                                             let _ = tx.send(rpc::Command::PeerList).await;
@@ -901,7 +986,7 @@ async fn main() {
                                             draw_state.force_full = true;
                                         } else if let Some(ref tx) = active_thread_tx {
                                             let _ = tx
-                                                .send(rpc::Command::Disconnect(parts[1].clone()))
+                                                .send(rpc::Command::Cert(parts[1].clone()))
                                                 .await;
                                         } else {
                                             status_msg =
